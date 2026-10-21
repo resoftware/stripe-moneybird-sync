@@ -5,13 +5,16 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import secrets
 import sqlite3
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
+
+USER_AGENT = "stripe-moneybird-sync/1.0"
 
 
 class SyncError(Exception):
@@ -43,10 +46,6 @@ def object_id(value):
     return value.get("id") if isinstance(value, dict) else value
 
 
-def relation_id(value):
-    return value[0] if isinstance(value, list) else value
-
-
 def date_of(timestamp, timezone):
     from zoneinfo import ZoneInfo
 
@@ -54,10 +53,19 @@ def date_of(timestamp, timezone):
 
 
 def minor(value, decimals):
-    amount = Decimal(str(value)) * (Decimal(10) ** decimals)
+    """Convert a Moneybird decimal string to integer currency units, refusing sub-unit values."""
+    try:
+        amount = Decimal(str(value)) * (Decimal(10) ** decimals)
+    except InvalidOperation:
+        raise SyncError("moneybird_amount_not_decimal") from None
     rounded = amount.quantize(Decimal(1), rounding=ROUND_HALF_UP)
-    require(abs(amount - rounded) < Decimal("0.001"), "odoo_amount_not_in_currency_units")
+    require(abs(amount - rounded) < Decimal("0.001"), "moneybird_amount_not_in_currency_units")
     return int(rounded)
+
+
+def major(value, decimals):
+    """Render integer currency units as the decimal string Moneybird expects."""
+    return str(Decimal(value).scaleb(-decimals).quantize(Decimal(1).scaleb(-decimals)))
 
 
 @contextlib.contextmanager
@@ -82,7 +90,7 @@ class Ledger:
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS operations (
                 reference TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
-                status TEXT NOT NULL, target_id INTEGER, updated_at INTEGER NOT NULL);
+                status TEXT NOT NULL, target_id TEXT, updated_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS runs (
                 id INTEGER PRIMARY KEY, started_at INTEGER NOT NULL,
                 finished_at INTEGER, mode TEXT NOT NULL, status TEXT NOT NULL,
@@ -91,10 +99,10 @@ class Ledger:
                 id INTEGER PRIMARY KEY, reference TEXT NOT NULL,
                 resolved_at INTEGER NOT NULL, reason TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS document_links (
-                reference TEXT PRIMARY KEY, target_id INTEGER NOT NULL UNIQUE,
+                reference TEXT PRIMARY KEY, target_id TEXT NOT NULL UNIQUE,
                 fingerprint TEXT NOT NULL, linked_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS contact_links (
-                reference TEXT PRIMARY KEY, target_id INTEGER NOT NULL,
+                reference TEXT PRIMARY KEY, target_id TEXT NOT NULL,
                 fingerprint TEXT NOT NULL, linked_at INTEGER NOT NULL);
         """)
         self.db.commit()
@@ -116,6 +124,7 @@ class Ledger:
 
     def link(self, kind, ref, target_id, fingerprint):
         require(kind in ("document", "contact"), "invalid_link_kind")
+        target_id = str(target_id)
         previous = self.linked(kind, ref)
         if previous:
             require(previous["target_id"] == target_id, "existing_link_target_changed")
@@ -125,7 +134,7 @@ class Ledger:
             claimed = self.db.execute(
                 "SELECT reference FROM document_links WHERE target_id=?", (target_id,)
             ).fetchone()
-            require(not claimed, "odoo_document_already_linked_to_other_source")
+            require(not claimed, "moneybird_document_already_linked_to_other_source")
             operations = self.db.execute(
                 "SELECT reference FROM operations WHERE target_id=?", (target_id,)
             ).fetchall()
@@ -136,7 +145,7 @@ class Ledger:
                     and not row[0].startswith(ref + ":")
                     for row in operations
                 ),
-                "odoo_document_already_owned_by_other_source",
+                "moneybird_document_already_owned_by_other_source",
             )
         with self.db:
             self.db.execute(
@@ -154,7 +163,7 @@ class Ledger:
                 """INSERT INTO operations VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(reference) DO UPDATE SET fingerprint=excluded.fingerprint,
                 status=excluded.status, target_id=excluded.target_id, updated_at=excluded.updated_at""",
-                (ref, fingerprint, status, target_id, int(time.time())),
+                (ref, fingerprint, status, None if target_id is None else str(target_id), int(time.time())),
             )
 
     def ensure(self, ref, fingerprint, lookup, create, verify):
@@ -163,6 +172,7 @@ class Ledger:
             require(operation["fingerprint"] == fingerprint, "operation_payload_changed")
         target = lookup()
         if target:
+            target = str(target)
             verify(target)
             if operation and operation["target_id"]:
                 require(target == operation["target_id"], "operation_target_changed")
@@ -172,13 +182,13 @@ class Ledger:
             raise UnknownOutcome("operation_result_missing_review_required")
         self.put(ref, fingerprint, "submitted")
         try:
-            target = create()
+            target = str(create())
         except Rejected:
             self.put(ref, fingerprint, "rejected")
             raise
         except Exception:
             self.put(ref, fingerprint, "unknown")
-            raise UnknownOutcome("odoo_write_outcome_unknown") from None
+            raise UnknownOutcome("moneybird_write_outcome_unknown") from None
         # Persist the ID before verification so an amount mismatch is recoverable without another create.
         self.put(ref, fingerprint, "created", target)
         verify(target)
@@ -210,30 +220,51 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def retry_after(headers, attempt):
+    try:
+        value = int(headers.get("Retry-After", ""))
+    except (TypeError, ValueError):
+        value = 2**attempt
+    return min(max(value, 1), 300)
+
+
 class Http:
     def __init__(self, opener=None, sleep=time.sleep):
         self.opener = opener or urllib.request.build_opener(NoRedirect())
         self.sleep = sleep
 
-    def request(self, url, headers, payload=None, safe=False):
-        body = None if payload is None else json.dumps(payload, allow_nan=False).encode()
-        for attempt in range(3 if safe else 1):
+    def request(self, url, headers, payload=None, safe=False, method=None, body=None):
+        if body is None and payload is not None:
+            body = json.dumps(payload, allow_nan=False).encode()
+            headers = {**headers, "Content-Type": "application/json"}
+        headers = {"User-Agent": USER_AGENT, "Accept": "application/json", **headers}
+        attempts = 3 if safe else 1
+        # A 429 is never committed, so writes may also wait and retry a few times.
+        throttled = 0
+        attempt = 0
+        while True:
             try:
-                request = urllib.request.Request(url, data=body, headers=headers)
+                request = urllib.request.Request(url, data=body, headers=headers, method=method)
                 with self.opener.open(request, timeout=45) as response:
                     data = response.read(16 * 1024 * 1024 + 1)
                 require(len(data) <= 16 * 1024 * 1024, "response_too_large")
-                return json.loads(data)
+                return json.loads(data) if data.strip() else None
             except urllib.error.HTTPError as error:
                 # Never include a response body: it can contain invoice PII, API keys, or tracebacks.
-                if safe and error.code in (429, 500, 502, 503, 504) and attempt < 2:
+                if error.code == 429 and throttled < 5:
+                    throttled += 1
+                    self.sleep(retry_after(error.headers, throttled))
+                    continue
+                if safe and error.code in (500, 502, 503, 504) and attempt < attempts - 1:
+                    attempt += 1
                     self.sleep(2**attempt)
                     continue
                 if 400 <= error.code < 500 and error.code != 408:
                     raise Rejected(f"remote_http_{error.code}") from None
                 raise UnknownOutcome(f"remote_http_{error.code}_outcome_unknown") from None
             except (urllib.error.URLError, TimeoutError, OSError):
-                if safe and attempt < 2:
+                if safe and attempt < attempts - 1:
+                    attempt += 1
                     self.sleep(2**attempt)
                     continue
                 raise UnknownOutcome("remote_transport_outcome_unknown") from None
@@ -285,68 +316,85 @@ class Stripe:
         return download_pdf(self.http, source.get("pdf") or source.get("invoice_pdf"))
 
 
-class Odoo:
-    def __init__(self, url, database, key, company_id, http):
-        parsed = urllib.parse.urlsplit(url)
-        require(
-            parsed.scheme == "https"
-            and parsed.hostname
-            and not parsed.username
-            and not parsed.query
-            and not parsed.fragment
-            and parsed.path in ("", "/"),
-            "invalid_odoo_url",
-        )
-        self.url, self.http, self.company_id = url.rstrip("/"), http, company_id
-        self.headers = {
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "User-Agent": "stripe-odoo-sync/1.0",
-        }
-        if database:
-            self.headers["X-Odoo-Database"] = database
+def multipart(fields, filename, data):
+    boundary = "----stripe-moneybird-" + secrets.token_hex(16)
+    body = b""
+    for key, value in fields.items():
+        body += (f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n').encode()
+    body += (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        "Content-Type: application/pdf\r\n\r\n"
+    ).encode()
+    body += data + f"\r\n--{boundary}--\r\n".encode()
+    return f"multipart/form-data; boundary={boundary}", body
 
-    def call(self, model, method, safe=False, **args):
-        context = {
-            "allowed_company_ids": [self.company_id],
-            "default_company_id": self.company_id,
-            "tracking_disable": True,
-            "mail_create_nosubscribe": True,
-            **args.pop("context", {}),
-        }
+
+class Moneybird:
+    """Thin Moneybird API v2 client. Paths are relative to the administration."""
+
+    base = "https://moneybird.com/api/v2"
+
+    def __init__(self, administration_id, token, http):
+        require(type(administration_id) is str and administration_id.isdigit(), "configure_administration_id")
+        self.administration_id, self.http = administration_id, http
+        self.headers = {"Authorization": f"Bearer {token}"}
+
+    def url(self, path, params=None):
+        require(
+            path.startswith("/") and "?" not in path and ".." not in path and not path.endswith(".json"),
+            "invalid_moneybird_path",
+        )
+        query = urllib.parse.urlencode(params or {})
+        return f"{self.base}/{self.administration_id}{path}.json" + ("?" + query if query else "")
+
+    def get(self, path, params=None):
+        return self.http.request(self.url(path, params), self.headers, safe=True)
+
+    def find(self, path, params=None):
+        """GET that treats 404 as absence; other rejections still propagate."""
+        try:
+            return self.get(path, params)
+        except Rejected as error:
+            if str(error) == "remote_http_404":
+                return None
+            raise
+
+    def list(self, path, params=None):
+        page = 1
+        while True:
+            items = self.get(path, {**(params or {}), "page": page, "per_page": 100})
+            require(isinstance(items, list), "invalid_moneybird_page")
+            yield from items
+            if len(items) < 100:
+                break
+            page += 1
+            require(page <= 1000, "moneybird_pagination_runaway")
+
+    def post(self, path, payload):
+        return self.http.request(self.url(path), self.headers, payload, method="POST")
+
+    def patch(self, path, payload=None):
+        return self.http.request(self.url(path), self.headers, payload or {}, method="PATCH")
+
+    def delete(self, path):
+        return self.http.request(self.url(path), self.headers, method="DELETE")
+
+    def upload(self, path, filename, data):
+        content_type, body = multipart({}, filename, data)
         return self.http.request(
-            f"{self.url}/json/2/{model}/{method}", self.headers, {**args, "context": context}, safe=safe
+            self.url(path), {**self.headers, "Content-Type": content_type}, method="POST", body=body
         )
 
-    def search(self, model, domain, fields, limit=100, context=None):
-        return self.call(
-            model,
-            "search_read",
-            safe=True,
-            domain=domain,
-            fields=fields,
-            limit=limit,
-            context=context or {},
-        )
+    def administration(self):
+        administrations = self.http.request(f"{self.base}/administrations.json", self.headers, safe=True)
+        require(isinstance(administrations, list), "invalid_moneybird_administrations")
+        matches = [item for item in administrations if str(item.get("id")) == self.administration_id]
+        require(len(matches) == 1, "moneybird_administration_not_accessible")
+        return matches[0]
 
-    def one(self, model, identifier, fields):
-        records = self.search(model, [["id", "=", identifier]], fields, limit=2)
-        require(len(records) == 1, "odoo_record_not_found")
-        return records[0]
 
-    def find(self, model, ref, field="ref"):
-        domain = [[field, "=", ref], ["company_id", "=", self.company_id]]
-        records = self.search(model, domain, ["id"], limit=2)
-        require(len(records) <= 1, "duplicate_odoo_reference")
-        return records[0]["id"] if records else None
-
-    def create(self, model, values):
-        result = self.call(model, "create", vals_list=[values])
-        require(
-            isinstance(result, list) and len(result) == 1 and type(result[0]) is int,
-            "invalid_odoo_create_result",
-        )
-        return result[0]
+def identifier(value):
+    return type(value) is str and value.isdigit()
 
 
 def load_config(path):
@@ -356,10 +404,8 @@ def load_config(path):
         "livemode",
         "start_date",
         "timezone",
-        "odoo_url",
-        "company_id",
-        "sales_journal_id",
-        "income_account_id",
+        "administration_id",
+        "revenue_ledger_account_id",
         "currencies",
         "tax_map",
         "no_tax",
@@ -370,26 +416,41 @@ def load_config(path):
         config["stripe_account_id"].startswith("acct_") and "REPLACE" not in config["stripe_account_id"],
         "configure_stripe_account_id",
     )
-    for key in ("company_id", "sales_journal_id", "income_account_id"):
-        require(type(config[key]) is int and config[key] > 0, f"configure_{key}")
+    for key in ("administration_id", "revenue_ledger_account_id"):
+        require(identifier(config[key]), f"configure_{key}")
+    for key in ("tax_map", "no_tax", "contact_map", "document_map", "ledger_account_map"):
+        mapping = config.get(key, {})
+        require(
+            isinstance(mapping, dict) and all(identifier(value) for value in mapping.values()),
+            f"invalid_{key}",
+        )
+    require(set(config["no_tax"]) <= {"none", "exempt", "reverse"}, "invalid_no_tax_treatment")
     dt.date.fromisoformat(config["start_date"])
     from zoneinfo import ZoneInfo
 
     ZoneInfo(config["timezone"])
-    require(config["currencies"], "configure_currencies")
-    for currency in config["currencies"].values():
-        require(
-            type(currency.get("odoo_id")) is int
-            and currency["odoo_id"] > 0
-            and type(currency.get("decimals")) is int
-            and 0 <= currency["decimals"] <= 3,
-            "configure_currency_id_and_decimals",
-        )
-    require(not config.get("sync_payments") or config.get("post_invoices"), "payments_require_posting")
-    for key in ("post_invoices", "sync_payments", "receipt_ownership_confirmed", "sync_pdfs"):
+    require(
+        isinstance(config["currencies"], dict)
+        and config["currencies"]
+        and all(
+            len(code) == 3 and code.isupper() and type(decimals) is int and 0 <= decimals <= 3
+            for code, decimals in config["currencies"].items()
+        ),
+        "configure_currencies",
+    )
+    for key in ("sync_payments", "receipt_ownership_confirmed", "sync_pdfs", "line_periods"):
         require(type(config.get(key, key == "sync_pdfs")) is bool, f"invalid_{key}")
+    require(config.get("void_action", "review") in ("review", "delete"), "invalid_void_action")
+    require(
+        config.get("uncollectible_action", "review") in ("review", "mark"), "invalid_uncollectible_action"
+    )
+    country = config.get("default_contact_country")
+    require(
+        country is None or (type(country) is str and len(country) == 2), "invalid_default_contact_country"
+    )
     if config.get("sync_payments"):
         require(config.get("receipt_ownership_confirmed") is True, "confirm_receipt_import_ownership")
-        for key in ("payment_journal_id", "payment_method_line_id"):
-            require(type(config.get(key)) is int and config[key] > 0, f"configure_{key}")
+        require(
+            identifier(config.get("payment_financial_account_id")), "configure_payment_financial_account_id"
+        )
     return config

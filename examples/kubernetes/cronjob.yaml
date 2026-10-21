@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: stripe-odoo-sync
+  name: stripe-moneybird-sync
 spec:
   schedule: "0 6 * * 1"
   timeZone: Etc/UTC
@@ -13,7 +13,7 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 0
-      activeDeadlineSeconds: 600
+      activeDeadlineSeconds: 1800
       ttlSecondsAfterFinished: 604800
       template:
         spec:
@@ -27,12 +27,12 @@ spec:
             seccompProfile: {type: RuntimeDefault}
           containers:
             - name: sync
-              image: ghcr.io/gwku/stripe-odoo-sync:1.0.0
+              image: ghcr.io/resoftware/stripe-moneybird-sync:1.0.0
               args: [sync]
               env:
                 - {name: SYNC_MODE, value: dry-run}
               envFrom:
-                - secretRef: {name: stripe-odoo-credentials}
+                - secretRef: {name: stripe-moneybird-credentials}
               securityContext:
                 readOnlyRootFilesystem: true
                 allowPrivilegeEscalation: false
@@ -45,6 +45,6 @@ spec:
                 - {name: config, mountPath: /config, readOnly: true}
           volumes:
             - name: state
-              persistentVolumeClaim: {claimName: stripe-odoo-state}
+              persistentVolumeClaim: {claimName: stripe-moneybird-state}
             - name: config
-              configMap: {name: stripe-odoo-config}
+              configMap: {name: stripe-moneybird-config}

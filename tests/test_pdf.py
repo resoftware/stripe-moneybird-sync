@@ -1,13 +1,12 @@
-import base64
 import io
 import unittest
 import urllib.error
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import test_sync as fixtures
 
-from stripe_odoo.core import Http, SyncError
-from stripe_odoo.pdf import MAX_PDF_BYTES, download_pdf
+from stripe_moneybird.core import Http, SyncError
+from stripe_moneybird.pdf import MAX_PDF_BYTES, download_pdf
 
 
 def pdf(number="EX-1", metadata="first"):
@@ -64,66 +63,53 @@ class PDFStoreTests(unittest.TestCase):
     def test_original_pdf_is_uploaded_once_and_verified_on_replay(self):
         result = self.worker().run()
         self.assertEqual(result["pdfs_saved"], 1)
-        self.assertEqual(self.odoo.creates, 2)  # Invoice plus original PDF.
+        self.assertEqual(self.moneybird.creates, 2)  # Invoice plus original PDF.
         result = self.worker().run()
         self.assertEqual(result["pdfs_reused"], 1)
-        self.assertEqual(self.odoo.creates, 2)
-        attachment = self.odoo.records["ir.attachment", 12]
-        self.assertEqual(base64.b64decode(attachment["raw"]), pdf())
-        self.assertEqual(attachment["res_id"], 11)
-        self.assertFalse(attachment["public"])
+        self.assertEqual(self.moneybird.creates, 2)
+        attachment = self.moneybird.invoices["11"]["attachments"][0]
+        self.assertEqual(attachment["filename"], "Stripe-in_test.pdf")
+        self.assertEqual(attachment["size"], len(pdf()))
 
     def test_existing_manual_pdf_with_different_metadata_is_reused_without_overwriting(self):
         fixtures.MatchingTests.setUp(self)
         self.settings["sync_pdfs"] = True
         self.stripe.pdf = lambda source: pdf(source["number"])
         target = fixtures.MatchingTests.external_invoice(self)
-        existing = self.odoo.create(
-            "ir.attachment",
+        self.moneybird.invoices[target]["attachments"].append(
             {
-                "name": "Invoice-EX-1.pdf",
-                "description": False,
-                "company_id": 1,
-                "res_model": "account.move",
-                "res_id": target,
-                "type": "binary",
-                "mimetype": "application/pdf",
-                "public": False,
-                "datas": base64.b64encode(pdf(metadata="manual-original")).decode(),
-            },
+                "id": "77",
+                "filename": "Invoice-EX-1.pdf",
+                "content_type": "application/pdf",
+                "size": len(pdf(metadata="manual-original")),
+            }
         )
-        before = dict(self.odoo.records["ir.attachment", existing])
+        before = dict(self.moneybird.invoices[target]["attachments"][0])
         self.assertEqual(self.worker().run()["pdfs_reused"], 1)
-        self.assertEqual(self.odoo.creates, 2)
-        self.assertEqual(self.odoo.records["ir.attachment", existing], before)
+        self.assertEqual(self.moneybird.creates, 1)
+        self.assertEqual(self.moneybird.invoices[target]["attachments"], [before])
 
     def test_dry_run_validates_pdf_without_uploading_or_recording_write_intents(self):
         self.assertEqual(self.worker(False).run()["pdfs_previewed"], 1)
-        self.assertEqual(self.odoo.creates, 0)
+        self.assertEqual(self.moneybird.creates, 0)
         self.assertEqual(self.ledger.db.execute("SELECT count(*) FROM operations").fetchone()[0], 0)
 
     def test_invalid_source_pdf_stops_before_contact_or_invoice_creation(self):
         self.stripe.pdf = lambda source: b"<html>expired link</html>"
         self.assertEqual(self.worker().run()["failed"], 1)
-        self.assertEqual(self.odoo.creates, 0)
+        self.assertEqual(self.moneybird.creates, 0)
 
-    def test_lost_pdf_create_response_recovers_without_another_attachment(self):
-        original = self.odoo.create
-
-        def create(model, values):
-            if model == "ir.attachment":
-                self.odoo.lose_response = True
-            return original(model, values)
-
-        with patch.object(self.odoo, "create", create):
-            self.assertEqual(self.worker().run()["failed"], 1)
+    def test_lost_upload_response_recovers_without_another_attachment(self):
+        self.moneybird.lose_upload_response = True
+        self.assertEqual(self.worker().run()["failed"], 1)
         self.assertEqual(self.worker().run()["pdfs_reused"], 1)
-        self.assertEqual(self.odoo.creates, 2)
+        self.assertEqual(self.moneybird.creates, 2)
+        self.assertEqual(len(self.moneybird.invoices["11"]["attachments"]), 1)
 
     def test_deleted_or_changed_saved_pdf_does_not_create_a_replacement(self):
         self.worker().run()
-        self.odoo.records["ir.attachment", 12]["raw"] = base64.b64encode(pdf("EX-2")).decode()
+        self.moneybird.invoices["11"]["attachments"][0]["size"] += 1
         self.assertEqual(self.worker().run()["failed"], 1)
-        del self.odoo.records["ir.attachment", 12]
+        self.moneybird.invoices["11"]["attachments"].clear()
         self.assertEqual(self.worker().run()["failed"], 1)
-        self.assertEqual(self.odoo.creates, 2)
+        self.assertEqual(self.moneybird.creates, 2)

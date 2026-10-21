@@ -8,13 +8,13 @@ import sqlite3
 import time
 from pathlib import Path
 
-from .core import Http, Ledger, Odoo, Stripe, SyncError, load_config, log, require, state_lock
+from .core import Http, Ledger, Moneybird, Stripe, SyncError, load_config, log, require, state_lock
 from .worker import Worker
 
 
 def main(argv=None):
     os.umask(0o077)
-    parser = argparse.ArgumentParser(description="Weekly Stripe to Odoo 19 invoice sync")
+    parser = argparse.ArgumentParser(description="Weekly Stripe to Moneybird invoice sync")
     parser.add_argument("command", choices=["sync", "backfill", "status", "backup", "reconcile", "resolve"])
     parser.add_argument("--config", default=os.getenv("SYNC_CONFIG", "/config/config.json"))
     parser.add_argument("--state", default=os.getenv("SYNC_STATE", "/state/ledger.sqlite3"))
@@ -26,7 +26,7 @@ def main(argv=None):
     parser.add_argument(
         "--confirm-request-finished-without-effect",
         action="store_true",
-        help="Attest that Odoo request completion and absence of accounting effects were verified",
+        help="Attest that Moneybird request completion and absence of accounting effects were verified",
     )
     args = parser.parse_args(argv)
     try:
@@ -77,20 +77,18 @@ def main(argv=None):
                     log(kind + "_links", links=[dict(row) for row in rows])
                 return 0
             config = load_config(args.config)
-            key, odoo_key = os.getenv("STRIPE_API_KEY"), os.getenv("ODOO_API_KEY")
-            require(bool(key) and bool(odoo_key), "api_credentials_required")
+            key, token = os.getenv("STRIPE_API_KEY"), os.getenv("MONEYBIRD_API_TOKEN")
+            require(bool(key) and bool(token), "api_credentials_required")
             http = Http()
-            odoo = Odoo(config["odoo_url"], config.get("odoo_database"), odoo_key, config["company_id"], http)
+            moneybird = Moneybird(config["administration_id"], token, http)
             stripe = Stripe(key, config["stripe_account_id"], config["livemode"], http)
             scope = {
                 "stripe_account_id": config["stripe_account_id"],
                 "livemode": config["livemode"],
-                "odoo_url": odoo.url,
-                "database": config.get("odoo_database"),
-                "company_id": config["company_id"],
+                "administration_id": config["administration_id"],
             }
             ledger.bind(scope)
-            worker = Worker(config, stripe, odoo, ledger, apply=args.mode == "apply")
+            worker = Worker(config, stripe, moneybird, ledger, apply=args.mode == "apply")
             with ledger.db:
                 run_id = ledger.db.execute(
                     "INSERT INTO runs (started_at, mode, status) VALUES (?, ?, 'running')",

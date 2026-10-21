@@ -4,10 +4,10 @@ RUN apk add --no-cache tzdata ca-certificates \
     && addgroup -g 10001 stripesync \
     && adduser -D -H -u 10001 -G stripesync stripesync
 WORKDIR /app
-COPY stripe_odoo /app/stripe_odoo
+COPY stripe_moneybird /app/stripe_moneybird
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 USER 10001:10001
-ENTRYPOINT ["python", "-m", "stripe_odoo"]
+ENTRYPOINT ["python", "-m", "stripe_moneybird"]
 CMD ["sync"]
-LABEL org.opencontainers.image.title="stripe-odoo-sync"
-LABEL org.opencontainers.image.description="Weekly Stripe to Odoo 19 invoice sync"
+LABEL org.opencontainers.image.title="stripe-moneybird-sync"
+LABEL org.opencontainers.image.description="Weekly Stripe to Moneybird invoice sync"

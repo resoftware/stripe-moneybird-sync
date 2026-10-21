@@ -13,7 +13,7 @@ Run from the repository root:
 cp config.example.json examples/kubernetes/config.json
 ```
 
-Replace the example values with your own Stripe account, Odoo connection, and
+Replace the example values with your own Stripe account, Moneybird administration, and
 accounting mappings. `config.json` is ignored by Git; keep API keys out of it.
 Adjust the schedule/time zone in `cronjob.yaml`, choose a StorageClass in
 `pvc.yaml` if needed, and pin the image to a published commit tag or digest.
@@ -25,14 +25,14 @@ values. The file is ignored by Git:
 
 ```dotenv
 STRIPE_API_KEY=REPLACE_WITH_RESTRICTED_STRIPE_KEY
-ODOO_API_KEY=REPLACE_WITH_ODOO_INTEGRATION_KEY
+MONEYBIRD_API_TOKEN=REPLACE_WITH_MONEYBIRD_API_TOKEN
 ```
 
 Create the namespace and credentials, then apply the example:
 
 ```sh
 kubectl apply -f examples/kubernetes/namespace.yaml
-kubectl -n stripe-odoo-sync create secret generic stripe-odoo-credentials \
+kubectl -n stripe-moneybird-sync create secret generic stripe-moneybird-credentials \
   --from-env-file=examples/kubernetes/.env
 kubectl apply -k examples/kubernetes
 ```
@@ -46,14 +46,15 @@ volume reference is rewritten automatically.
 The initial template is dry-run. Create a manual Job to validate access and mappings:
 
 ```sh
-kubectl -n stripe-odoo-sync create job --from=cronjob/stripe-odoo-sync sync-check
-kubectl -n stripe-odoo-sync logs -f job/sync-check
+kubectl -n stripe-moneybird-sync create job --from=cronjob/stripe-moneybird-sync sync-check
+kubectl -n stripe-moneybird-sync logs -f job/sync-check
 ```
 
 For real imports, change `SYNC_MODE` to `apply` in `cronjob.yaml` and reapply the
-Kustomization. `post_invoices` in `config.json` controls posting; without it the
-worker creates drafts. `sync_payments` is a separate opt-in requiring its own
-journal and ownership settings. Create a new manual Job for the updated template.
+Kustomization. External sales invoices are booked as soon as they are created,
+so review the dry-run output first. `sync_payments` is a separate opt-in requiring
+a dedicated Stripe financial account and the ownership confirmation. Create a new
+manual Job for the updated template.
 
 When the results are accepted, change `suspend` to `false` and reapply. The example
 schedule runs weekly at 06:00 UTC. There is no web service, ingress, or webhook.
@@ -70,7 +71,7 @@ The PVC provides persistence, not an off-machine backup. Schedule a separate Job
 using the worker's `backup` command:
 
 ```sh
-python -m stripe_odoo backup --state /state/ledger.sqlite3 --output /backup/ledger.sqlite3
+python -m stripe_moneybird backup --state /state/ledger.sqlite3 --output /backup/ledger.sqlite3
 ```
 
 Mount the live state PVC and a separate writable snapshot volume for that Job.
