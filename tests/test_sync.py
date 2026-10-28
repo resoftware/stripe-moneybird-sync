@@ -97,7 +97,7 @@ class FakeStripe:
 
     def get(self, path, params=None):
         if path.startswith("/v1/tax_rates/"):
-            return {"id": path.rsplit("/", 1)[1], "percentage": 21.0}
+            return {"id": path.rsplit("/", 1)[1], "country": "NL", "percentage": 21.0}
         return copy.deepcopy(next(item for item in self.invoices if path.endswith("/" + item["id"])))
 
     def list(self, path, params=None):
@@ -424,6 +424,7 @@ class PlanningTests(unittest.TestCase):
 
     def test_line_period_is_opt_in_and_inclusive(self):
         item = line()
+        item["parent"] = {"type": "subscription_item_details"}
         item["period"] = {"start": 1767222000, "end": 1769900400}  # 2026-01-01 .. 2026-02-01 00:00 CET
         detail = self.plan(lines=[item])[0]["body"]["details_attributes"][0]
         self.assertNotIn("period", detail)
@@ -687,6 +688,145 @@ class WorkerTests(unittest.TestCase):
             self.worker().run()
 
 
+class DescriptionTests(unittest.TestCase):
+    def names(self, settings=None, **changes):
+        item = {**line(), "period": {"start": 1767222000, "end": 1769900400}, **changes}
+        plan, _ = document_plan(settings or config(), invoice(), invoice(), [item], "6")
+        return [detail["description"] for detail in plan["body"]["details_attributes"]]
+
+    def test_one_off_line_keeps_stripe_description_without_period(self):
+        self.assertEqual(
+            self.names(description="Hours (uren, 24 oktober 2026)"), ["Hours (uren, 24 oktober 2026)"]
+        )
+
+    def test_subscription_line_uses_pdf_name_and_adds_period(self):
+        parent = {"parent": {"type": "subscription_item_details"}}
+        for description in ("1 × Zorgeloos (voor €139.00 / maand)", "1 × Zorgeloos (at €139.00 / month)"):
+            self.assertEqual(
+                self.names(description=description, **parent), ["Zorgeloos [2026-01-01 to 2026-02-01]"]
+            )
+        self.assertEqual(
+            self.names({**config(), "period_separator": "tot"}, **parent),
+            ["Service [2026-01-01 tot 2026-02-01]"],
+        )
+        self.assertEqual(
+            self.names(description="Custom subscription text", **parent),
+            ["Custom subscription text [2026-01-01 to 2026-02-01]"],
+        )
+
+
+class DiscountTests(unittest.TestCase):
+    def plan(self, labels=None, **changes):
+        source = {**invoice(), "total_excluding_tax": 7500, "total": 9075}
+        item = {**line(), "discount_amounts": [{"amount": 2500, "discount": "di_1"}], **changes}
+        item["taxes"] = [{**item["taxes"][0], "amount": 1575}]
+        plan, expected = document_plan(config(), source, source, [item], "6", discount_labels=labels)
+        return plan["body"]["details_attributes"], expected
+
+    def test_discount_becomes_a_negative_line_with_the_same_tax(self):
+        details, expected = self.plan({"di_1": "WELCOME (25% off)"})
+        self.assertEqual([d["description"] for d in details], ["Service", "WELCOME (25% off)"])
+        self.assertEqual([d["price"] for d in details], ["100.00", "-25.00"])
+        self.assertEqual(details[0]["tax_rate_id"], details[1]["tax_rate_id"])
+        self.assertEqual(expected["net"], 7500)
+        self.assertEqual(expected["lines"], [("3", "5", -2500), ("3", "5", 10000)])
+
+    def test_discount_on_credit_note_flips_sign(self):
+        source = {**invoice(), "id": "cn_test", "object": "credit_note", "number": "CN-1"}
+        source.update(total_excluding_tax=7500, total=9075)
+        item = {**line(), "discount_amounts": [{"amount": 2500, "discount": "di_1"}]}
+        item["taxes"] = [{**item["taxes"][0], "amount": 1575}]
+        plan, expected = document_plan(config(), source, invoice(), [item], "6", "EX-1")
+        self.assertEqual([d["price"] for d in plan["body"]["details_attributes"]], ["-100.00", "25.00"])
+        self.assertEqual(expected["total"], -9075)
+
+    def test_unlabelled_discount_falls_back_to_a_generic_name(self):
+        details, _ = self.plan()
+        self.assertEqual(details[1]["description"], "Discount")
+
+    def test_worker_labels_discounts_from_the_coupon_and_tolerates_unreadable_coupons(self):
+        class Stripe:
+            def get(self, path):
+                if path == "/v1/coupons/ok":
+                    return {"name": "FREE", "percent_off": 100.0}
+                raise Rejected("remote_http_403")
+
+        worker = Worker.__new__(Worker)
+        worker.stripe = Stripe()
+        lines = [
+            {
+                "discounts": [
+                    {"id": "di_ok", "source": {"coupon": "ok"}},
+                    {"id": "di_hidden", "source": {"coupon": "hidden"}},
+                    {"id": "di_embedded", "coupon": {"name": "HALF", "percent_off": 50}},
+                    "di_not_expanded",
+                ]
+            }
+        ]
+        self.assertEqual(
+            worker.discount_labels(lines),
+            {"di_ok": "FREE (100% off)", "di_hidden": "Discount", "di_embedded": "HALF (50% off)"},
+        )
+
+    def test_inclusive_tax_discounts_stay_netted(self):
+        source = {**invoice(), "total_excluding_tax": 6198, "total": 7500}
+        item = {**line(), "amount": 10000, "discount_amounts": [{"amount": 2500, "discount": "di_1"}]}
+        item["taxes"] = [{**item["taxes"][0], "amount": 1302, "tax_behavior": "inclusive"}]
+        plan, _ = document_plan(config(), source, source, [item], "6")
+        self.assertEqual(len(plan["body"]["details_attributes"]), 1)
+
+    def test_discounted_invoice_round_trips_through_the_worker(self):
+        with patch("sys.stdout", new=io.StringIO()):
+            settings, stripe, moneybird = config(), FakeStripe(), FakeMoneybird()
+            moneybird.contacts["6"] = {"id": "6", "company_name": "Example", "archived": False}
+            stripe.invoices[0].update(total_excluding_tax=7500, total=9075, amount_paid=9075)
+            stripe.lines[0]["discount_amounts"] = [{"amount": 2500, "discount": "di_1"}]
+            stripe.lines[0]["taxes"][0]["amount"] = 1575
+            with tempfile.TemporaryDirectory() as temp, closing(Ledger(Path(temp) / "s.sqlite3")) as ledger:
+                for _ in range(2):
+                    worker = Worker(settings, stripe, moneybird, ledger, apply=True)
+                    self.assertEqual(worker.run()["verified"], 1)
+        self.assertEqual(moneybird.invoices["11"]["total_price_incl_tax"], "90.75")
+        self.assertEqual(len(moneybird.invoices["11"]["details"]), 2)
+
+
+class TaxRuleTests(unittest.TestCase):
+    worker = WorkerTests.worker
+
+    def setUp(self):
+        WorkerTests.setUp(self)
+        self.stripe.lines[0]["taxes"][0]["tax_rate_details"]["tax_rate"] = "txr_per_invoice"
+
+    def test_unknown_tax_rate_id_is_mapped_by_country_and_percentage(self):
+        self.settings["tax_rate_map"] = {"NL:21": "5"}
+        self.assertEqual(self.worker().run()["verified"], 1)
+        self.assertEqual(self.moneybird.creates, 1)
+
+    def test_unknown_tax_rate_without_matching_rule_fails_without_writing(self):
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.settings["tax_rate_map"] = {"NL:0": "9"}
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.moneybird.creates, 0)
+
+    def test_rule_percentage_must_match_the_moneybird_rate(self):
+        self.settings["tax_rate_map"] = {"NL:9": "5"}
+        with self.assertRaisesRegex(SyncError, "tax_rate_rule_percentage_mismatch"):
+            self.worker().run()
+
+    def test_fully_discounted_invoice_uses_the_untaxed_rate_without_an_exemption_mapping(self):
+        self.stripe.invoices[0].update(
+            total=0, total_excluding_tax=0, amount_paid=0, customer_tax_exempt="reverse"
+        )
+        self.stripe.lines[0].update(taxes=[], discount_amounts=[{"amount": 10000}])
+        self.assertEqual(self.worker().run()["verified"], 1)
+        self.assertEqual(self.moneybird.invoices["11"]["total_price_incl_tax"], "0.00")
+
+    def test_untaxed_invoice_with_value_still_needs_a_treatment(self):
+        self.settings["no_tax"] = {}
+        self.stripe.lines[0]["taxes"] = []
+        self.assertEqual(self.worker().run()["failed"], 1)
+
+
 class MatchingTests(unittest.TestCase):
     worker = WorkerTests.worker
 
@@ -857,6 +997,18 @@ class MatchingTests(unittest.TestCase):
 
     def test_shared_email_without_matching_name_does_not_merge_or_create(self):
         self.moneybird.contacts["6"]["company_name"] = "Different business"
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.moneybird.creates, 0)
+
+    def test_nameless_customer_links_a_unique_mailbox_match(self):
+        self.stripe.invoices[0].update(customer_name=None, customer_tax_ids=[])
+        self.moneybird.contacts["6"]["tax_number"] = ""
+        self.assertEqual(self.worker().run()["contacts_linked"], 1)
+        self.assertEqual(self.moneybird.creates, 1)
+
+    def test_nameless_customer_with_ambiguous_mailbox_match_is_reviewed(self):
+        self.stripe.invoices[0].update(customer_name=None, customer_tax_ids=[])
+        self.moneybird.contacts["7"] = {**self.moneybird.contacts["6"], "id": "7"}
         self.assertEqual(self.worker().run()["failed"], 1)
         self.assertEqual(self.moneybird.creates, 0)
 

@@ -60,6 +60,15 @@ class Worker:
             require(
                 Decimal(str(percentage)) == Decimal(str(rate["percentage"])), "tax_rate_percentage_mismatch"
             )
+        for key, identifier in config.get("tax_rate_map", {}).items():
+            rate = tax_rates.get(identifier)
+            require(
+                rate is not None
+                and rate["active"]
+                and rate["tax_rate_type"] == "sales_invoice"
+                and Decimal(key.split(":", 1)[1]) == Decimal(str(rate["percentage"] or 0)),
+                "tax_rate_rule_percentage_mismatch",
+            )
         for identifier in set(config["no_tax"].values()):
             rate = tax_rates.get(identifier)
             require(
@@ -125,7 +134,7 @@ class Worker:
         linked = self.ledger.linked("contact", ref)
         require(not existing or not linked or existing == linked["target_id"], "existing_link_target_changed")
         if not existing:
-            matched = Matcher(self).contact(ref, values)
+            matched = Matcher(self).contact(ref, values, named=bool(invoice.get("customer_name")))
             if matched:
                 self.counts["contacts_linked"] += 1
                 log("existing_contact_linked", source_id=source_id, target_id=matched)
@@ -196,8 +205,53 @@ class Worker:
             lambda _: require(complete(), "action_not_complete"),
         )
 
+    def configured_taxes(self, lines):
+        """Stripe Tax creates a new tax-rate ID per invoice; map those by country and percentage."""
+        rules = self.config.get("tax_rate_map", {})
+        tax_map = dict(self.config["tax_map"])
+        for line in lines:
+            for tax in line.get("taxes") or []:
+                identifier = object_id((tax.get("tax_rate_details") or {}).get("tax_rate"))
+                if not identifier or identifier in tax_map or not rules:
+                    continue
+                rate = self.stripe.get(f"/v1/tax_rates/{identifier}")
+                key = f"{rate.get('country')}:{Decimal(str(rate.get('percentage'))).normalize():f}"
+                require(key in rules, "tax_rate_mapping_required")
+                tax_map[identifier] = rules[key]
+        return {**self.config, "tax_map": tax_map}
+
+    def discount_labels(self, lines):
+        """Label discount lines like Stripe's PDF, "<coupon name> (<n>% off)"; fall back to "Discount"."""
+        labels = {}
+        for line in lines:
+            for discount in line.get("discounts") or []:
+                if not isinstance(discount, dict) or discount["id"] in labels:
+                    continue
+                # The pinned API version embeds the coupon; newer ones reference it from "source".
+                coupon = discount.get("coupon") or (discount.get("source") or {}).get("coupon")
+                label = "Discount"
+                try:
+                    if coupon and not isinstance(coupon, dict):
+                        coupon = self.stripe.get(f"/v1/coupons/{object_id(coupon)}")
+                except SyncError:
+                    coupon = None  # Restricted API keys may not read coupons.
+                if coupon and coupon.get("name"):
+                    label = coupon["name"]
+                    if coupon.get("percent_off"):
+                        label += f" ({Decimal(str(coupon['percent_off'])).normalize():f}% off)"
+                labels[discount["id"]] = label
+        return labels
+
     def document(self, source, invoice, lines, contact, original_number=None):
-        plan, expected = document_plan(self.config, source, invoice, lines, contact, original_number)
+        plan, expected = document_plan(
+            self.configured_taxes(lines),
+            source,
+            invoice,
+            lines,
+            contact,
+            original_number,
+            invoice.get("_discount_labels"),
+        )
         ref, body = plan["ref"], plan["body"]
         fingerprint = digest({"body": body, "expected": expected})
         managed = self.find_document(body["source_url"])
@@ -409,7 +463,10 @@ class Worker:
             return
         require(invoice["status"] in ("open", "paid", "uncollectible"), "unsupported_invoice_status")
         pdf = self.fetch_pdf(invoice)
-        invoice["_lines"] = list(self.stripe.list(f"/v1/invoices/{invoice['id']}/lines"))
+        invoice["_lines"] = list(
+            self.stripe.list(f"/v1/invoices/{invoice['id']}/lines", {"expand[]": "data.discounts"})
+        )
+        invoice["_discount_labels"] = self.discount_labels(invoice["_lines"])
         contact = self.contact(invoice)
         document_id = self.document(invoice, invoice, invoice["_lines"], contact)
         if pdf is not None:

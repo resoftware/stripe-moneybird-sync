@@ -5,6 +5,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import time
@@ -418,13 +419,18 @@ def load_config(path):
     )
     for key in ("administration_id", "revenue_ledger_account_id"):
         require(identifier(config[key]), f"configure_{key}")
-    for key in ("tax_map", "no_tax", "contact_map", "document_map", "ledger_account_map"):
+    for key in ("tax_map", "tax_rate_map", "no_tax", "contact_map", "document_map", "ledger_account_map"):
         mapping = config.get(key, {})
         require(
             isinstance(mapping, dict) and all(identifier(value) for value in mapping.values()),
             f"invalid_{key}",
         )
     require(set(config["no_tax"]) <= {"none", "exempt", "reverse"}, "invalid_no_tax_treatment")
+    require(
+        all(re.fullmatch(r"[A-Z]{2}:\d+(\.\d+)?", key) for key in config.get("tax_rate_map", {})),
+        "invalid_tax_rate_map_key",
+    )
+    require(type(config.get("period_separator", "to")) is str, "invalid_period_separator")
     dt.date.fromisoformat(config["start_date"])
     from zoneinfo import ZoneInfo
 

@@ -43,7 +43,7 @@ class Matcher:
         self.worker = worker
         self.config, self.moneybird, self.ledger = worker.config, worker.moneybird, worker.ledger
 
-    def contact(self, ref, values):
+    def contact(self, ref, values, named=True):
         expected = identity(values)
         fingerprint = digest(expected)
         linked = self.ledger.linked("contact", ref)
@@ -78,7 +78,12 @@ class Matcher:
             possible.append(candidate)
             # A conflicting VAT number must never be overridden by a shared mailbox.
             vat_conflict = expected["vat"] and actual["vat"] and expected["vat"] != actual["vat"]
-            if "name" in shared and bool(shared & {"vat", "email"}) and not vat_conflict:
+            # Stripe customers without a name (common for invoices created by a product) can only be
+            # matched by mailbox; ambiguity below still demands an explicit contact_map entry.
+            identified = ("name" in shared and bool(shared & {"vat", "email"})) or (
+                not named and "email" in shared
+            )
+            if identified and not vat_conflict:
                 matches.append(candidate)
         require(len(matches) <= 1, "ambiguous_existing_contact_use_contact_map")
         require(matches or not possible, "existing_contact_requires_explicit_contact_map")

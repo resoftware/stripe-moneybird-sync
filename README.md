@@ -173,6 +173,8 @@ Moneybird IDs are strings. Fill in:
 | `revenue_ledger_account_id` | Default revenue ledger account for invoice lines. |
 | `currencies` | Currency code to number of decimals, e.g. `{"EUR": 2}`. Only explicitly configured currencies are accepted. |
 | `tax_map` | Stripe tax-rate ID to Moneybird sales tax-rate ID. |
+| `tax_rate_map` | Optional `"<country>:<percentage>"` to Moneybird tax-rate ID, e.g. `{"NL:21": "…"}`, for Stripe Tax, which creates a new tax-rate ID per invoice. Used only for tax-rate IDs missing from `tax_map`; an unmapped rate fails the invoice. Preflight checks the percentage. |
+| `period_separator` | Optional word between the dates in a subscription line's period, default `to` (e.g. `tot` for Dutch). |
 | `no_tax` | Stripe exemption treatment (`none`, `exempt`, `reverse`) to a zero-percentage Moneybird tax rate. `none` covers ordinary untaxed sales. |
 | `contact_map` | Optional Stripe customer ID to an existing Moneybird contact ID. Use for migration matches and changed historical customer snapshots. |
 | `document_map` | Optional Stripe invoice/credit-note ID to an existing external sales invoice ID, to resolve ambiguous migration matches. Financial verification still applies. |
@@ -184,12 +186,19 @@ Moneybird IDs are strings. Fill in:
 | `void_action` | `review` (default) or `delete`. |
 | `uncollectible_action` | `review` (default) or `mark`. |
 
+Fully discounted invoices (total 0) without tax lines use the `none` rate whatever
+the customer's exemption status. Subscription lines take the product name shown on
+Stripe's PDF plus the service period; one-off lines keep their Stripe description.
+Discounts appear as separate negative lines named after the coupon, like Stripe's
+PDF; the worker reads coupons when the key allows and falls back to "Discount".
+
 Contacts first use explicit mappings and the Stripe customer ID stored as the
 Moneybird `customer_id` of contacts the worker created. Otherwise, the worker
 searches contacts, including archived ones, by e-mail, VAT number and name. A
 unique match requires the same normalized name plus VAT number or e-mail, without
-conflicting VAT numbers. Name-only, e-mail-only, conflicting, ambiguous, and
-archived matches stop for review; no replacement contact is created. It creates a
+conflicting VAT numbers. A Stripe customer without a name matches a unique e-mail.
+Name-only, e-mail-only, conflicting, ambiguous, and archived matches stop for
+review; no replacement contact is created. It creates a
 new contact only when no possible existing contact is found.
 
 Auto-created contacts use the finalized invoice's name, address, e-mail and EU

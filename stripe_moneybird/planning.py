@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from decimal import Decimal
 
@@ -42,7 +43,9 @@ def taxes_for(config, invoice, line):
         else:
             require(tax.get("tax_behavior") == "exclusive", "tax_behavior_required")
         return target, dict(expected), inclusive
-    treatment = invoice.get("customer_tax_exempt", "none")
+    # A fully discounted invoice carries no tax, whatever the customer's tax status; Moneybird still
+    # needs a rate on the line, so the ordinary untaxed mapping is used.
+    treatment = "none" if invoice.get("total") == 0 else invoice.get("customer_tax_exempt", "none")
     require(treatment in config["no_tax"], "no_tax_treatment_mapping_required")
     return config["no_tax"][treatment], {}, 0
 
@@ -54,7 +57,7 @@ def period_of(period, timezone):
     return f"{start}..{end}"
 
 
-def document_plan(config, source, invoice, lines, contact_id, original_number=None):
+def document_plan(config, source, invoice, lines, contact_id, original_number=None, discount_labels=None):
     credit = source.get("object") == "credit_note"
     currency = source["currency"].upper()
     require(currency in config["currencies"], "currency_mapping_required")
@@ -101,9 +104,24 @@ def document_plan(config, source, invoice, lines, contact_id, original_number=No
             product, config["revenue_ledger_account_id"]
         )
         description = line.get("description") or line["id"]
-        period = line.get("period")
+        period = None
+        if (line.get("parent") or {}).get("type") == "subscription_item_details":
+            # Stripe's API wraps subscription lines as "1 × Name (at €9.00 / month)"; its PDF shows just the name.
+            wrapped = re.fullmatch(r"\d+ × (.+) \([^()]*\)", description)
+            description = wrapped.group(1) if wrapped else description
+            period = line.get("period")
         if period:
-            description += f" [{date_of(period['start'], config['timezone'])} to {date_of(period['end'], config['timezone'])}]"
+            separator = config.get("period_separator", "to")
+            description += (
+                f" [{date_of(period['start'], config['timezone'])} {separator}"
+                f" {date_of(period['end'], config['timezone'])}]"
+            )
+        # Show discounts as their own negative lines, like Stripe's invoice. Inclusive taxes stay netted.
+        separate = (
+            [item for item in line.get("discount_amounts", []) if item["amount"]] if not inclusive else []
+        )
+        if separate:
+            net += discount
         unit = Decimal(net) / quantity
         if unit == unit.to_integral_value():
             amount, price = str(quantity.normalize()), major(sign * int(unit), decimals)
@@ -121,6 +139,16 @@ def document_plan(config, source, invoice, lines, contact_id, original_number=No
         if period and config.get("line_periods"):
             detail["period"] = period_of(period, config["timezone"])
         details.append(detail)
+        for item in separate:
+            details.append(
+                {
+                    "description": (discount_labels or {}).get(item.get("discount"), "Discount"),
+                    "price": major(-sign * item["amount"], decimals),
+                    "amount": "1",
+                    "tax_rate_id": tax_rate_id,
+                    "ledger_account_id": ledger_account_id,
+                }
+            )
     require(bool(details), "empty_document_requires_review")
     require(net_total == source["total_excluding_tax"], "source_line_net_total_mismatch")
     require(net_total + sum(expected_taxes.values()) == source["total"], "source_line_gross_total_mismatch")

@@ -106,3 +106,14 @@ billing country stop for review unless `default_contact_country` is set.
 Verified against the real administration once Trevi grants API access:
 the exact shape of `details` and `attachments` in list responses, whether
 `source_url` round-trips unchanged, and the 422 body on locked periods.
+
+## Upstream 1.0.6 merged (2026-10-28)
+
+Gerwin's commits up to `cdd8b56` are ported: Stripe Tax per-invoice rates via
+`tax_rate_map` (`"<country>:<percentage>"`, percentage checked against the
+Moneybird rate in preflight), discounts as separate negative lines labelled after
+the coupon, subscription lines named like Stripe's PDF with a configurable
+`period_separator`, nameless customers matched on a unique e-mail, and fully
+discounted invoices needing no exemption mapping. Because a Moneybird line
+always needs a tax rate, a zero-total untaxed invoice uses the `none` rate. The
+Odoo-specific attachment fix (`raw` instead of `datas`) does not apply.
