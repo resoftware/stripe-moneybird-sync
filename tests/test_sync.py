@@ -210,8 +210,13 @@ class FakeMoneybird:
     def create_invoice(self, body):
         identifier = self.next_id()
         details, taxes, net = [], {}, Decimal(0)
+        inclusive = bool(body.get("prices_are_incl_tax"))
         for index, detail in enumerate(body["details_attributes"]):
             subtotal = Decimal(detail["price"]) * Decimal(detail["amount"])
+            if inclusive:
+                subtotal = (subtotal * 100 / (100 + RATES[detail["tax_rate_id"]])).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
             net += subtotal
             taxes[detail["tax_rate_id"]] = taxes.get(detail["tax_rate_id"], Decimal(0)) + subtotal
             details.append(
@@ -231,6 +236,9 @@ class FakeMoneybird:
             for rate, amount in taxes.items()
         )
         total = net + tax + self.amount_delta
+        if inclusive:
+            total = sum(Decimal(d["price"]) * Decimal(d["amount"]) for d in body["details_attributes"])
+            total += self.amount_delta
         record = {
             key: body.get(key)
             for key in ("contact_id", "reference", "date", "due_date", "currency", "source", "source_url")
@@ -323,7 +331,14 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual((detail["price"], detail["amount"], detail["tax_rate_id"]), ("100.00", "1", "5"))
         self.assertEqual(
             expected,
-            {"net": 10000, "total": 12100, "taxes": {"5": 2100}, "lines": [("3", "5", 10000)], "decimals": 2},
+            {
+                "net": 10000,
+                "total": 12100,
+                "taxes": {"5": 2100},
+                "details": [("Service", "3", "5", 10000)],
+                "lines": [("3", "5", 10000)],
+                "decimals": 2,
+            },
         )
         self.assertEqual(plan["body"]["source_url"], "https://dashboard.stripe.com/test/invoices/in_test")
         self.assertEqual(minor("123", 0), 123)
@@ -822,6 +837,86 @@ class DiscountTests(unittest.TestCase):
                     self.assertEqual(worker.run()["verified"], 1)
         self.assertEqual(moneybird.invoices["11"]["total_price_incl_tax"], "90.75")
         self.assertEqual(len(moneybird.invoices["11"]["details"]), 2)
+
+
+class ImpliedTaxTests(unittest.TestCase):
+    """Stripe collected no tax; the price to an EU customer includes 21% VAT."""
+
+    def settings(self):
+        return {**config(), "untaxed_eu_tax_rate_id": "5", "_untaxed_eu_percentage": "21.0"}
+
+    def untaxed(self, total, country="FR", **changes):
+        source = {**invoice(), "total": total, "total_excluding_tax": total, "amount_paid": total}
+        source["customer_address"] = {"country": country} if country else None
+        source.update(changes)
+        item = {**line(), "amount": total, "taxes": []}
+        return source, item
+
+    def test_eu_customer_is_booked_gross_with_inclusive_vat(self):
+        source, item = self.untaxed(900)
+        plan, expected = document_plan(self.settings(), source, source, [item], "6")
+        detail = plan["body"]["details_attributes"][0]
+        self.assertTrue(plan["body"]["prices_are_incl_tax"])
+        self.assertEqual((detail["price"], detail["tax_rate_id"]), ("9.00", "5"))
+        self.assertEqual((expected["net"], expected["total"], expected["taxes"]), (744, 900, {"5": 156}))
+        self.assertEqual(expected["details"], [("Service", "3", "5", 744)])
+
+    def test_rounding_matches_moneybird_per_line(self):
+        source, item = self.untaxed(28800, country="NL")
+        _, expected = document_plan(self.settings(), source, source, [item], "6")
+        self.assertEqual((expected["net"], expected["taxes"]), (23802, {"5": 4998}))
+
+    def test_missing_country_uses_the_default_contact_country(self):
+        source, item = self.untaxed(900, country=None)
+        _, expected = document_plan(
+            {**self.settings(), "default_contact_country": "NL"}, source, source, [item], "6"
+        )
+        self.assertEqual(expected["net"], 744)
+        _, expected = document_plan(
+            {**self.settings(), "default_contact_country": "US"}, source, source, [item], "6"
+        )
+        self.assertEqual(expected["net"], 900)
+
+    def test_non_eu_exempt_taxed_and_zero_invoices_are_unaffected(self):
+        for country, changes in (("GB", {}), ("CA", {}), ("FR", {"customer_tax_exempt": "reverse"})):
+            with self.subTest(country=country, changes=changes):
+                settings = self.settings()
+                settings["no_tax"]["reverse"] = "9"
+                source, item = self.untaxed(900, country=country, **changes)
+                plan, expected = document_plan(settings, source, source, [item], "6")
+                self.assertFalse(plan["body"]["prices_are_incl_tax"])
+                self.assertEqual(expected["net"], 900)
+        plan, expected = document_plan(self.settings(), invoice(), invoice(), [line()], "6")
+        self.assertFalse(plan["body"]["prices_are_incl_tax"])
+        self.assertEqual(expected["taxes"], {"5": 2100})
+        source, item = self.untaxed(0)
+        self.assertEqual(document_plan(self.settings(), source, source, [item], "6")[1]["total"], 0)
+
+    def test_credit_note_keeps_the_sign(self):
+        source, item = self.untaxed(500)
+        credit = {**source, "id": "cn_test", "object": "credit_note", "number": "CN-1"}
+        _, expected = document_plan(self.settings(), credit, source, [item], "6", "EX-1")
+        self.assertEqual((expected["net"], expected["total"], expected["taxes"]), (-413, -500, {"5": -87}))
+
+    def test_worker_creates_and_verifies_inclusive_documents(self):
+        with patch("sys.stdout", new=io.StringIO()):
+            settings, stripe, moneybird = config(), FakeStripe(), FakeMoneybird()
+            settings["untaxed_eu_tax_rate_id"] = "5"
+            moneybird.contacts["6"] = {"id": "6", "company_name": "Example", "archived": False}
+            stripe.invoices[0].update(total=900, total_excluding_tax=900, amount_paid=900)
+            stripe.lines[0].update(amount=900, taxes=[])
+            with tempfile.TemporaryDirectory() as temp, closing(Ledger(Path(temp) / "s.sqlite3")) as ledger:
+                for _ in range(2):
+                    self.assertEqual(
+                        Worker(settings, stripe, moneybird, ledger, apply=True).run()["verified"], 1
+                    )
+                document = moneybird.invoices["11"]
+                self.assertEqual(
+                    (document["total_price_excl_tax"], document["total_price_incl_tax"]), ("7.44", "9.00")
+                )
+                settings["untaxed_eu_tax_rate_id"] = "9"  # The zero-percentage rate.
+                with self.assertRaisesRegex(SyncError, "positive_sales_rate"):
+                    Worker(settings, stripe, moneybird, ledger, apply=True).run()
 
 
 class TaxRuleTests(unittest.TestCase):

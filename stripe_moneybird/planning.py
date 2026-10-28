@@ -2,11 +2,40 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from .core import date_of, major, object_id, require
 
 SOURCE = "Stripe"
+EU = {
+    "AT",
+    "BE",
+    "BG",
+    "HR",
+    "CY",
+    "CZ",
+    "DK",
+    "EE",
+    "FI",
+    "FR",
+    "DE",
+    "GR",
+    "HU",
+    "IE",
+    "IT",
+    "LV",
+    "LT",
+    "LU",
+    "MT",
+    "NL",
+    "PL",
+    "PT",
+    "RO",
+    "SK",
+    "SI",
+    "ES",
+    "SE",
+}
 
 
 def reference(config, kind, source_id):
@@ -73,6 +102,7 @@ def document_plan(config, source, invoice, lines, contact_id, original_number=No
         "external_issuer_requires_review",
     )
     details, expected_taxes, net_total, sign = [], defaultdict(int), 0, -1 if credit else 1
+    taxed = False
     for line in lines:
         require(
             line["currency"].upper() == currency if "currency" in line else credit, "line_currency_mismatch"
@@ -83,6 +113,7 @@ def document_plan(config, source, invoice, lines, contact_id, original_number=No
             "billing_credit_grant_requires_review",
         )
         tax_rate_id, tax_totals, inclusive = taxes_for(config, invoice, line)
+        taxed = taxed or bool(line.get("taxes"))
         discount = sum(item["amount"] for item in line.get("discount_amounts", []))
         net = line["amount"] - discount - inclusive
         net_total += net
@@ -188,17 +219,51 @@ def document_plan(config, source, invoice, lines, contact_id, original_number=No
         "source_id": source["id"],
         "body": body,
     }
+    nets = [minor_of(detail, decimals) for detail in details]
+    net, taxes = sign * net_total, {key: sign * value for key, value in expected_taxes.items()}
+    implied = None if taxed or source["total"] == 0 else implied_tax(config, invoice)
+    if implied:
+        # Stripe collected no tax, but the price to an EU customer legally includes VAT: book the
+        # gross amount as tax-inclusive and let Moneybird split it, the way it does per line.
+        rate_id, percentage = implied
+        body["prices_are_incl_tax"] = True
+        for detail in details:
+            detail["tax_rate_id"] = rate_id
+        nets = [net_of(gross, percentage) for gross in nets]
+        net = sum(nets)
+        taxes = {rate_id: sign * source["total"] - net}
     expected = {
-        "net": sign * net_total,
+        "net": net,
         "total": sign * source["total"],
-        "taxes": {key: sign * value for key, value in expected_taxes.items()},
+        "taxes": taxes,
+        "details": [
+            (detail["description"], detail["ledger_account_id"], detail["tax_rate_id"], line_net)
+            for detail, line_net in zip(details, nets, strict=True)
+        ],
         "lines": sorted(
-            (detail["ledger_account_id"], detail["tax_rate_id"], minor_of(detail, decimals))
-            for detail in details
+            (detail["ledger_account_id"], detail["tax_rate_id"], line_net)
+            for detail, line_net in zip(details, nets, strict=True)
         ),
         "decimals": decimals,
     }
     return plan, expected
+
+
+def implied_tax(config, invoice):
+    rate_id = config.get("untaxed_eu_tax_rate_id")
+    if not rate_id or invoice.get("customer_tax_exempt", "none") != "none":
+        return None
+    country = (invoice.get("customer_address") or {}).get("country") or config.get("default_contact_country")
+    if country not in EU:
+        return None
+    percentage = config.get("_untaxed_eu_percentage")
+    require(percentage is not None, "untaxed_eu_tax_rate_percentage_missing")
+    return rate_id, Decimal(str(percentage))
+
+
+def net_of(gross, percentage):
+    """Moneybird derives the net amount per inclusive line, rounding half up in currency units."""
+    return int((Decimal(gross) * 100 / (100 + percentage)).quantize(Decimal(1), rounding=ROUND_HALF_UP))
 
 
 def minor_of(detail, decimals):
