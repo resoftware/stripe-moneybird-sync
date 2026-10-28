@@ -253,7 +253,11 @@ def implied_tax(config, invoice):
     rate_id = config.get("untaxed_eu_tax_rate_id")
     if not rate_id or invoice.get("customer_tax_exempt", "none") != "none":
         return None
-    country = (invoice.get("customer_address") or {}).get("country") or config.get("default_contact_country")
+    country = (
+        invoice.get("_country")
+        or (invoice.get("customer_address") or {}).get("country")
+        or config.get("default_contact_country")
+    )
     if country not in EU:
         return None
     percentage = config.get("_untaxed_eu_percentage")
