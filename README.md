@@ -180,6 +180,7 @@ Moneybird IDs are strings. Fill in:
 | `document_map` | Optional Stripe invoice/credit-note ID to an existing external sales invoice ID, to resolve ambiguous migration matches. Financial verification still applies. |
 | `ledger_account_map` | Optional Stripe product ID to a revenue ledger account ID; otherwise the default account is used. |
 | `default_contact_country` | Moneybird requires a country on each contact. Stripe customers without a billing country stop for review unless this two-letter code is set. |
+| `skip_zero_total` | Skip invoices with a zero total (free trials, fully discounted periods) instead of booking a zero document and creating a contact; false by default. |
 | `line_periods` | Pass Stripe service periods as Moneybird detail periods; false by default. |
 | `sync_pdfs` | Preserve original invoice and credit-note PDFs as attachments; true by default. |
 | `sync_payments`, `receipt_ownership_confirmed`, `payment_financial_account_id` | Payment import opt-in, its ownership confirmation and the Stripe financial account. |
@@ -202,7 +203,8 @@ review; no replacement contact is created. It creates a
 new contact only when no possible existing contact is found.
 
 Auto-created contacts use the finalized invoice's name, address, e-mail and EU
-VAT ID as company contacts. The first snapshot is frozen. A later differing
+VAT ID as company contacts; a customer without a name is named after its e-mail
+address. Each Stripe customer is resolved once per run. The first snapshot is frozen. A later differing
 snapshot requires an explicit `contact_map`. Existing contacts are reused without
 overwriting their details. Original PDF bytes are uploaded as attachments on the
 corresponding external sales invoice, including matched existing invoices. A

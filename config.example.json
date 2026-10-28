@@ -15,6 +15,7 @@
   "ledger_account_map": {},
   "default_contact_country": null,
   "line_periods": false,
+  "skip_zero_total": false,
   "sync_pdfs": true,
   "sync_payments": false,
   "receipt_ownership_confirmed": false,

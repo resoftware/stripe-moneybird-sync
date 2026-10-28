@@ -88,7 +88,14 @@ def document_plan(config, source, invoice, lines, contact_id, original_number=No
         net_total += net
         for identifier, amount in tax_totals.items():
             expected_taxes[identifier] += amount
-        quantity = Decimal(str(line.get("quantity_decimal") or line.get("quantity") or 1))
+        raw_quantity = line.get("quantity_decimal")
+        if raw_quantity is None:
+            raw_quantity = line.get("quantity")
+        quantity = Decimal(str(1 if raw_quantity is None else raw_quantity))
+        if quantity == 0:
+            # Metered tiers without usage report a zero quantity and amount; they carry nothing.
+            require(line["amount"] == 0 and not tax_totals, "zero_quantity_line_with_amount")
+            continue
         require(quantity > 0, "invalid_line_quantity")
         pricing = line.get("pricing") or {}
         product = object_id((pricing.get("price_details") or {}).get("product"))

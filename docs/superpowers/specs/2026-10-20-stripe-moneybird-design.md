@@ -101,11 +101,23 @@ errors.
 Moneybird requires a country on every contact. Stripe customers without a
 billing country stop for review unless `default_contact_country` is set.
 
-## Left to the builder
+## Verified against the real administration (2026-10-28)
 
-Verified against the real administration once Trevi grants API access:
-the exact shape of `details` and `attachments` in list responses, whether
-`source_url` round-trips unchanged, and the 422 body on locked periods.
+A dry run with the live Stripe key and the Re: Software administration confirmed:
+list responses of `external_sales_invoices` carry `details` (with `amount`,
+`amount_decimal`, `total_price_excl_tax_with_discount`, `period`), `payments`,
+`attachments` (`filename`, `content_type`, `size`) and `tax_totals`; `source`
+and `source_url` come back as empty strings on manual entries. Four invoices
+that had been entered by hand were linked, not duplicated, once the three
+contacts without an e-mail address were mapped in `contact_map`. Still open:
+the 422 body on locked periods and the shape of a create response.
+
+Findings that shaped the configuration: the product issues many € 0 trial
+invoices (`skip_zero_total`), customers usually have only an e-mail address
+(contact name falls back to the e-mail, `default_contact_country` needed),
+metered tiers produce zero-quantity lines (dropped), and the manual entries
+used the "Geen btw" rate and the "Ongecategoriseerde inkomsten" ledger with
+net-of-fee payments on the ING account.
 
 ## Upstream 1.0.6 merged (2026-10-28)
 

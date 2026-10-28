@@ -444,7 +444,13 @@ def load_config(path):
         ),
         "configure_currencies",
     )
-    for key in ("sync_payments", "receipt_ownership_confirmed", "sync_pdfs", "line_periods"):
+    for key in (
+        "sync_payments",
+        "receipt_ownership_confirmed",
+        "sync_pdfs",
+        "line_periods",
+        "skip_zero_total",
+    ):
         require(type(config.get(key, key == "sync_pdfs")) is bool, f"invalid_{key}")
     require(config.get("void_action", "review") in ("review", "delete"), "invalid_void_action")
     require(

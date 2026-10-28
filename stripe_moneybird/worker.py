@@ -16,7 +16,7 @@ class Worker:
         self.config, self.stripe, self.moneybird, self.ledger = config, stripe, moneybird, ledger
         self.apply = apply
         self.counts = defaultdict(int)
-        self.cache, self.index, self.administration = {}, {}, None
+        self.cache, self.index, self.administration, self.contacts = {}, {}, None, {}
 
     # Moneybird reads are cached per run; writes evict the document they touch.
     def read(self, identifier, fresh=False):
@@ -101,6 +101,12 @@ class Worker:
     def contact(self, invoice):
         source_id = object_id(invoice.get("customer"))
         require(bool(source_id), "stripe_customer_required")
+        # Subscriptions invoice the same customer every period; resolve each customer once per run.
+        if source_id not in self.contacts:
+            self.contacts[source_id] = self.resolve_contact(invoice, source_id)
+        return self.contacts[source_id]
+
+    def resolve_contact(self, invoice, source_id):
         mapped = self.config.get("contact_map", {}).get(source_id)
         ref = reference(self.config, "customer", source_id)
         if mapped:
@@ -113,7 +119,8 @@ class Worker:
         country = address.get("country") or self.config.get("default_contact_country")
         require(bool(country), "customer_country_required_set_default_contact_country")
         values = {
-            "company_name": invoice.get("customer_name") or source_id,
+            # Product customers often have only a mailbox; a readable contact name beats the Stripe ID.
+            "company_name": invoice.get("customer_name") or invoice.get("customer_email") or source_id,
             "customer_id": source_id,
             "email": invoice.get("customer_email") or "",
             "address1": address.get("line1") or "",
@@ -456,6 +463,10 @@ class Worker:
 
     def invoice(self, invoice):
         if invoice["status"] == "draft":
+            self.counts["skipped"] += 1
+            return
+        if invoice["total"] == 0 and self.config.get("skip_zero_total"):
+            # Free trials and fully discounted periods carry no revenue, tax or payment.
             self.counts["skipped"] += 1
             return
         if invoice["status"] == "void":

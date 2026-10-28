@@ -58,7 +58,11 @@ class Matcher:
                 not operation or operation["status"] == "rejected",
                 "existing_contact_matching_blocked_by_prior_operation",
             )
-            terms = [values.get(key) for key in ("email", "tax_number", "company_name") if values.get(key)]
+            terms = list(
+                dict.fromkeys(
+                    values[key] for key in ("email", "tax_number", "company_name") if values.get(key)
+                )
+            )
             if not terms:
                 return None
             candidates, seen = [], set()
@@ -160,10 +164,13 @@ class Matcher:
                 )
                 require(len(candidates) < 100, "too_many_existing_invoice_candidates")
                 decimals = expected["decimals"]
+                # Documents carrying a Stripe URL belong to another Stripe document; only manual
+                # entries are candidates for adoption.
                 matches = [
                     item
                     for item in candidates
-                    if item["currency"] == body["currency"]
+                    if not is_stripe_url(item.get("source_url"))
+                    and item["currency"] == body["currency"]
                     and minor(item["total_price_incl_tax"], decimals) == expected["total"]
                     and minor(item["total_price_excl_tax"], decimals) == expected["net"]
                 ]

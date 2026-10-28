@@ -347,6 +347,22 @@ class PlanningTests(unittest.TestCase):
         )
         self.assertEqual(expected["lines"], [("3", "5", 10000)])
 
+    def test_zero_quantity_metered_lines_are_dropped(self):
+        empty = {
+            **line(),
+            "id": "il_tier",
+            "description": "Email Overage",
+            "amount": 0,
+            "quantity": 0,
+            "taxes": [],
+        }
+        plan, expected = self.plan(lines=[line(), empty])
+        self.assertEqual(len(plan["body"]["details_attributes"]), 1)
+        self.assertEqual(expected["total"], 12100)
+        empty["amount"] = 100
+        with self.assertRaisesRegex(SyncError, "zero_quantity_line_with_amount"):
+            self.plan(lines=[line(), empty])
+
     def test_inclusive_tax_is_normalized_to_net(self):
         item = line()
         item["amount"] = 12100
@@ -584,6 +600,24 @@ class WorkerTests(unittest.TestCase):
         self.stripe.invoices[0]["customer_name"] = "Changed customer"
         self.assertEqual(self.worker().run()["failed"], 1)
         self.assertEqual(self.moneybird.creates, 2)
+
+    def test_nameless_customer_uses_its_mailbox_as_contact_name_and_is_resolved_once(self):
+        self.settings["contact_map"] = {}
+        self.moneybird.contacts.clear()
+        self.stripe.invoices[0].update(customer_name=None, customer_email="billing@example.test")
+        self.stripe.invoices.append({**self.stripe.invoices[0], "id": "in_other", "number": "EX-2"})
+        self.assertEqual(self.worker().run()["verified"], 2)
+        self.assertEqual(self.moneybird.creates, 3)  # One contact, two invoices.
+        self.assertEqual(self.moneybird.contacts["11"]["company_name"], "billing@example.test")
+
+    def test_zero_total_invoices_can_be_skipped(self):
+        self.stripe.invoices[0].update(total=0, total_excluding_tax=0, amount_paid=0)
+        self.stripe.lines[0].update(amount=0, taxes=[])
+        self.assertEqual(self.worker().run()["verified"], 1)
+        self.settings["skip_zero_total"] = True
+        self.stripe.invoices[0]["id"] = "in_free"
+        self.assertEqual(self.worker().run()["skipped"], 1)
+        self.assertEqual(self.moneybird.creates, 1)
 
     def test_customer_without_country_needs_a_default(self):
         self.settings["contact_map"] = {}
@@ -912,7 +946,6 @@ class MatchingTests(unittest.TestCase):
         target = self.external_invoice()
         document = self.moneybird.invoices[target]
         mutations = [
-            (document, "source_url", "https://dashboard.stripe.com/test/invoices/in_other"),
             (document["details"][0], "ledger_account_id", "99"),
             (document["details"][0], "tax_rate_id", "9"),
             (document["details"][0], "total_price_excl_tax_with_discount", "90.00"),
@@ -925,6 +958,14 @@ class MatchingTests(unittest.TestCase):
                 self.assertEqual(self.moneybird.creates, 1)
                 self.assertEqual(self.moneybird.actions, [])
                 record[field] = previous
+
+    def test_document_owned_by_another_stripe_source_is_not_adopted(self):
+        target = self.external_invoice()
+        self.moneybird.invoices[target]["source_url"] = "https://dashboard.stripe.com/test/invoices/in_other"
+        self.assertEqual(self.worker().run()["verified"], 1)
+        self.assertEqual(self.moneybird.creates, 2)
+        self.settings["document_map"] = {"in_test": target}
+        self.assertEqual(self.worker().run()["failed"], 1)
 
     def test_other_contact_invoice_is_not_adopted(self):
         target = self.external_invoice()
