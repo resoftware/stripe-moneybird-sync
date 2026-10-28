@@ -17,6 +17,7 @@ class Worker:
         self.apply = apply
         self.counts = defaultdict(int)
         self.cache, self.index, self.administration, self.contacts = {}, {}, None, {}
+        self.countries = {}
 
     # Moneybird reads are cached per run; writes evict the document they touch.
     def read(self, identifier, fresh=False):
@@ -126,7 +127,7 @@ class Worker:
             require(contact is not None and not contact.get("archived"), "mapped_contact_missing_or_archived")
             return mapped
         address = invoice.get("customer_address") or {}
-        country = address.get("country") or self.config.get("default_contact_country")
+        country = invoice.get("_country") or self.config.get("default_contact_country")
         require(bool(country), "customer_country_required_set_default_contact_country")
         values = {
             # Product customers often have only a mailbox; a readable contact name beats the Stripe ID.
@@ -464,6 +465,34 @@ class Worker:
                 "invoice_unpaid_amount_requires_review",
             )
 
+    def customer_country(self, invoice):
+        """Billing country from the invoice address, else from the card that paid it."""
+        country = (invoice.get("customer_address") or {}).get("country")
+        if country:
+            return country
+        source_id = object_id(invoice.get("customer"))
+        if source_id in self.countries:
+            return self.countries[source_id]
+        country = None
+        for allocation in self.stripe.list(
+            "/v1/invoice_payments", {"invoice": invoice["id"], "status": "paid"}
+        ):
+            payment = allocation.get("payment") or {}
+            if payment.get("type") != "payment_intent":
+                continue
+            intent = self.stripe.get(
+                f"/v1/payment_intents/{object_id(payment['payment_intent'])}", {"expand[]": "latest_charge"}
+            )
+            charge = intent.get("latest_charge") or {}
+            if isinstance(charge, dict):
+                billing = ((charge.get("billing_details") or {}).get("address") or {}).get("country")
+                card = ((charge.get("payment_method_details") or {}).get("card") or {}).get("country")
+                country = billing or card
+            if country:
+                break
+        self.countries[source_id] = country
+        return country
+
     def invoice(self, invoice):
         if invoice["status"] == "draft":
             self.counts["skipped"] += 1
@@ -481,6 +510,7 @@ class Worker:
             self.stripe.list(f"/v1/invoices/{invoice['id']}/lines", {"expand[]": "data.discounts"})
         )
         invoice["_discount_labels"] = self.discount_labels(invoice["_lines"])
+        invoice["_country"] = self.customer_country(invoice)
         contact = self.contact(invoice)
         document_id = self.document(invoice, invoice, invoice["_lines"], contact)
         if pdf is not None:

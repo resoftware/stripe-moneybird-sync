@@ -898,6 +898,25 @@ class ImpliedTaxTests(unittest.TestCase):
         _, expected = document_plan(self.settings(), credit, source, [item], "6", "EX-1")
         self.assertEqual((expected["net"], expected["total"], expected["taxes"]), (-413, -500, {"5": -87}))
 
+    def test_missing_address_takes_the_country_of_the_paying_card(self):
+        with patch("sys.stdout", new=io.StringIO()):
+            settings, stripe, moneybird = config(), FakeStripe(), FakeMoneybird()
+            settings.update(untaxed_eu_tax_rate_id="5", contact_map={}, default_contact_country="NL")
+            stripe.invoices[0].update(total=900, total_excluding_tax=900, amount_paid=900)
+            del stripe.invoices[0]["customer_address"]
+            stripe.lines[0].update(amount=900, taxes=[])
+            stripe.allocations = [{"payment": {"type": "payment_intent", "payment_intent": "pi_gb"}}]
+            original = stripe.get
+            stripe.get = lambda path, params=None: (
+                {"latest_charge": {"payment_method_details": {"card": {"country": "GB"}}}}
+                if path.startswith("/v1/payment_intents/")
+                else original(path, params)
+            )
+            with tempfile.TemporaryDirectory() as temp, closing(Ledger(Path(temp) / "s.sqlite3")) as ledger:
+                self.assertEqual(Worker(settings, stripe, moneybird, ledger, apply=True).run()["verified"], 1)
+            self.assertEqual(moneybird.contacts["11"]["country"], "GB")
+            self.assertEqual(moneybird.invoices["12"]["total_price_excl_tax"], "9.00")
+
     def test_worker_creates_and_verifies_inclusive_documents(self):
         with patch("sys.stdout", new=io.StringIO()):
             settings, stripe, moneybird = config(), FakeStripe(), FakeMoneybird()
