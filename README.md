@@ -314,11 +314,11 @@ verification against a real administration.
 
 ## Image releases
 
-The included workflow checks pull requests and pushes to `main`. Publishing is
-an explicit manual workflow run with `publish` enabled. It builds amd64 and arm64
-images under `ghcr.io/resoftware/stripe-moneybird-sync`, tagged with `VERSION`
-and `sha-<full Git commit>`. Pushes to `main` only check and build locally in CI.
-
-Pin the production overlay to a published commit tag or image digest. The
-version tag is a build alias; do not rely on it as immutable. Local tests never
-push an image.
+The included workflow checks pull requests and pushes. A push to `main` or
+`develop` also publishes amd64 and arm64 images under
+`ghcr.io/resoftware/stripe-moneybird-sync`, tagged
+`<branch>-<commit time UTC>-<sha7>` (the tag ArgoCD Image Updater follows on
+the Re: Software cluster), `sha-<full Git commit>` and the `VERSION` alias.
+The version tag is a build alias; do not rely on it as immutable. Local tests
+never push an image. The cluster manifests live in `resoftware-iac` under
+`deploy/projects/custom/stripe-moneybird-sync`.
