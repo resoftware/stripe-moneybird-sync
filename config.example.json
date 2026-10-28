@@ -10,6 +10,7 @@
   "tax_rate_map": {},
   "period_separator": "to",
   "no_tax": {"none": "123456789012345678"},
+  "untaxed_eu_tax_rate_id": null,
   "contact_map": {},
   "document_map": {},
   "ledger_account_map": {},

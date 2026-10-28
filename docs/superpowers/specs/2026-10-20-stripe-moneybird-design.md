@@ -129,3 +129,14 @@ the coupon, subscription lines named like Stripe's PDF with a configurable
 discounted invoices needing no exemption mapping. Because a Moneybird line
 always needs a tax rate, a zero-total untaxed invoice uses the `none` rate. The
 Odoo-specific attachment fix (`raw` instead of `datas`) does not apply.
+
+## Inclusive VAT for untaxed EU sales (2026-10-28)
+
+StaticForm's Stripe account collects no VAT. Under the € 10,000 EU threshold
+Dutch VAT applies to EU consumers, and to NL and EU businesses without a VAT
+number on the invoice, so the Stripe price is legally VAT-inclusive.
+`untaxed_eu_tax_rate_id` books such invoices gross with `prices_are_incl_tax`
+and the given rate; Moneybird derives the net per line (half-up rounding,
+confirmed against the API: € 9,00 → € 7,44 + € 1,56). Verification compares
+the derived nets. The lasting fix is Stripe Tax with address collection in the
+product, after which the rates arrive from Stripe via `tax_map`/`tax_rate_map`.

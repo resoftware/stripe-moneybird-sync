@@ -431,6 +431,8 @@ def load_config(path):
         "invalid_tax_rate_map_key",
     )
     require(type(config.get("period_separator", "to")) is str, "invalid_period_separator")
+    rate = config.get("untaxed_eu_tax_rate_id")
+    require(rate is None or identifier(rate), "invalid_untaxed_eu_tax_rate_id")
     dt.date.fromisoformat(config["start_date"])
     from zoneinfo import ZoneInfo
 

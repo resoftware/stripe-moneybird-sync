@@ -69,6 +69,16 @@ class Worker:
                 and Decimal(key.split(":", 1)[1]) == Decimal(str(rate["percentage"] or 0)),
                 "tax_rate_rule_percentage_mismatch",
             )
+        if config.get("untaxed_eu_tax_rate_id"):
+            rate = tax_rates.get(config["untaxed_eu_tax_rate_id"])
+            require(
+                rate is not None
+                and rate["active"]
+                and rate["tax_rate_type"] == "sales_invoice"
+                and Decimal(str(rate["percentage"] or 0)) > 0,
+                "untaxed_eu_tax_rate_must_be_a_positive_sales_rate",
+            )
+            self.config = {**self.config, "_untaxed_eu_percentage": str(rate["percentage"])}
         for identifier in set(config["no_tax"].values()):
             rate = tax_rates.get(identifier)
             require(
@@ -171,22 +181,15 @@ class Worker:
             require(actual.get(field) == body[field], "moneybird_document_identity_mismatch")
         require(str(actual["contact_id"]) == str(body["contact_id"]), "moneybird_document_identity_mismatch")
         require(
-            actual.get("due_date") == body.get("due_date") and not actual.get("prices_are_incl_tax"),
+            actual.get("due_date") == body.get("due_date")
+            and bool(actual.get("prices_are_incl_tax")) == body["prices_are_incl_tax"],
             "moneybird_document_due_date_or_tax_mode_mismatch",
         )
         decimals = expected["decimals"]
         require(
             len(actual["details"]) == len(body["details_attributes"]), "moneybird_invoice_line_count_mismatch"
         )
-        planned = Counter(
-            (
-                detail["description"],
-                detail["ledger_account_id"],
-                detail["tax_rate_id"],
-                minor(Decimal(detail["price"]) * Decimal(detail["amount"]), decimals),
-            )
-            for detail in body["details_attributes"]
-        )
+        planned = Counter(expected["details"])
         stored = Counter(
             (
                 detail["description"],
