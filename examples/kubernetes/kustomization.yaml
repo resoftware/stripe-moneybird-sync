@@ -1,11 +1,11 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-namespace: stripe-odoo-sync
+namespace: stripe-moneybird-sync
 resources:
   - namespace.yaml
   - pvc.yaml
   - cronjob.yaml
 configMapGenerator:
-  - name: stripe-odoo-config
+  - name: stripe-moneybird-config
     files:
       - config.json

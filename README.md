@@ -1,70 +1,77 @@
-# Stripe to Odoo sync
+# Stripe to Moneybird sync
 
-Stripe issues my invoices and collects payments; Odoo is where I keep the
-accounts. This project moves the issued documents into Odoo without having to
-enter the same invoice twice. It also recognises invoices and contacts that
+Stripe issues our invoices and collects payments; Moneybird is where we keep the
+accounts. This project moves the issued documents into Moneybird without having
+to enter the same invoice twice. It also recognises invoices and contacts that
 were entered manually before the integration existed.
 
-It is a Python 3.13 command-line worker, packaged as a Docker image. A run
-checks Stripe for invoices and credit notes, validates their accounting mappings,
-reuses or creates the corresponding Odoo records, saves the original PDFs, and
+It started life as Gerwin's [stripe-odoo-sync](https://github.com/gwku/stripe-odoo-sync)
+and keeps its operating model; the Moneybird-specific choices are written up in
+[the design note](docs/superpowers/specs/2026-10-20-stripe-moneybird-design.md).
+
+It is a Python 3.13 command-line worker, packaged as a Docker image. A run checks
+Stripe for invoices and credit notes, validates their accounting mappings, reuses
+or creates the corresponding Moneybird records, saves the original PDFs, and
 exits. SQLite keeps the links and operation history between runs.
 
-I run it as a **weekly Kubernetes CronJob**, with a persistent volume for SQLite,
-secrets supplied by a secret manager, and daily state/configuration backups to
-AWS S3. That is one way to operate it: you can run the same worker directly with
-Python, Docker, cron, a systemd timer, or another job runner with persistent state.
+We run it as a **weekly Kubernetes CronJob**, with a persistent volume for SQLite
+and secrets supplied by a secret manager. That is one way to operate it: you can
+run the same worker directly with Python, Docker, cron, a systemd timer, or
+another job runner with persistent state.
 
-This repository contains the worker, Dockerfile, tests, image-build workflow,
-and a [generic Kubernetes example](examples/kubernetes/README.md). My production
-manifests, secret-manager integration, monitoring rules, and AWS configuration
-live in a separate infrastructure repository and are not included here.
+This repository contains the worker, Dockerfile, tests, image-build workflow, and
+a [generic Kubernetes example](examples/kubernetes/README.md). Production
+manifests, secret-manager integration and monitoring rules live in the
+infrastructure repository and are not included here.
 
 ## Quick start with Python
 
-Requirements: Python 3.13 or newer on Linux/macOS, Stripe API access, and an
-Odoo 19 database with external API access and an integration user. The worker
-uses Stripe's REST API and Odoo's JSON-2 API. It uses only the Python standard library.
+Requirements: Python 3.13 or newer on Linux/macOS, Stripe API access, and a
+Moneybird administration with an API token (a personal API token or an OAuth
+access token with the `sales_invoices` and `settings` scopes). The worker uses
+Stripe's REST API and Moneybird's API v2, with only the Python standard library.
 
 ```sh
-git clone https://github.com/gwku/stripe-odoo-sync.git
-cd stripe-odoo-sync
+git clone https://github.com/resoftware/stripe-moneybird-sync.git
+cd stripe-moneybird-sync
 python3 -m venv .venv
 . .venv/bin/activate
 cp config.example.json config.local.json
 ```
 
-Fill in `config.local.json` with your own account, company, journal, revenue,
-currency, and tax mappings. Supply `STRIPE_API_KEY` and `ODOO_API_KEY` through
-your environment or secret manager. Credentials do not belong in the JSON file.
+Fill in `config.local.json` with your own account, administration, ledger
+account, currency, and tax mappings. Supply `STRIPE_API_KEY` and
+`MONEYBIRD_API_TOKEN` through your environment or secret manager. Credentials do
+not belong in the JSON file.
 
 ```sh
-python -m stripe_odoo sync --mode dry-run \
+python -m stripe_moneybird sync --mode dry-run \
   --config config.local.json --state ./state/ledger.sqlite3
 
-# Create real Odoo records after checking your mappings.
-python -m stripe_odoo sync --mode apply \
+# Create real Moneybird records after checking your mappings.
+python -m stripe_moneybird sync --mode apply \
   --config config.local.json --state ./state/ledger.sqlite3
 ```
 
-`apply` creates drafts unless `post_invoices` is enabled. Payment registration is
-a separate option. A dry run makes no Odoo writes, but can persist verified links
-in the local ledger. Use the **same ledger** for subsequent runs and back it up.
+Moneybird external sales invoices have no draft state: `apply` books them. A dry
+run makes no Moneybird writes, but can persist verified links in the local
+ledger. Use the **same ledger** for subsequent runs and back it up.
 
 ## Run with Docker
 
-The image is published as `ghcr.io/gwku/stripe-odoo-sync` for amd64 and arm64.
-Registry access is required if the package is private. You can also build it:
+The image is published as `ghcr.io/resoftware/stripe-moneybird-sync` for amd64
+and arm64. Registry access is required if the package is private. You can also
+build it:
 
 ```sh
-docker build -t stripe-odoo-sync:local .
+docker build -t stripe-moneybird-sync:local .
 mkdir -p state
 docker run --rm --read-only \
   --user "$(id -u):$(id -g)" \
-  -e STRIPE_API_KEY -e ODOO_API_KEY \
+  -e STRIPE_API_KEY -e MONEYBIRD_API_TOKEN \
   --mount "type=bind,src=$PWD/config.local.json,dst=/config/config.json,readonly" \
   --mount "type=bind,src=$PWD/state,dst=/state" \
-  stripe-odoo-sync:local sync --mode apply
+  stripe-moneybird-sync:local sync --mode apply
 ```
 
 The default image user is UID/GID `10001`. The local example above uses your host
@@ -77,18 +84,11 @@ injected at runtime. Pin a published commit tag or image digest for deployments.
 The [example setup](examples/kubernetes/README.md) supplies a namespace, PVC,
 ConfigMap generation, and CronJob. It explains how to supply credentials and
 activate a schedule using your own configuration. It is deliberately generic:
-it does not contain my company's accounting mappings, private hosts, secrets,
-or cloud storage settings.
+it does not contain accounting mappings, secrets, or cloud storage settings.
 
-In my deployment, the sync uses `concurrencyPolicy: Forbid`, automatic write
-retries are disabled, and scheduled/manual jobs share the same state volume and
-file lock. A separate daily job runs the backup command, uploads the consistent
-snapshot and configuration to S3, then downloads both files and verifies their
-checksums. Monitoring checks failed and overdue jobs.
-
-You do not need that infrastructure to run the worker. The operational contract
-is the same everywhere: retain the ledger, allow one writer at a time, preserve
-the configuration, and keep a restorable backup outside the worker's machine.
+The operational contract is the same everywhere: retain the ledger, allow one
+writer at a time, preserve the configuration, and keep a restorable backup
+outside the worker's machine.
 
 ## Behavior
 
@@ -99,118 +99,157 @@ All line, credit-note, and payment collections are paginated. Stripe requests us
 the explicit `2025-03-31.basil` API version; schema changes require fixture updates
 and sandbox verification before changing that version.
 
-The default `dry-run` mode makes no Odoo writes. It checks connectivity, company,
-journal, income-account, currency, and supported tax configuration, then validates
-source document totals and produces amount previews. It cannot prove Odoo's tax
-computation without creating a draft. `apply` creates customer contacts, invoice
-drafts, and linked credit-note drafts, then reads back their identity, lines,
-accounts, tax groups, and totals. It does not send emails or collect payments.
+The default `dry-run` mode makes no Moneybird writes. It checks connectivity,
+administration access, ledger accounts, tax rates (including the percentage
+against the Stripe tax rate), and the payment account, then validates source
+document totals and produces amount previews. `apply` creates contacts and
+external sales invoices, then reads back their contact, dates, currency, lines,
+ledger accounts, tax rates, and totals. It does not send e-mails or collect
+payments.
 
-`post_invoices: true` enables posting only after draft verification. Optional
-`sync_payments: true` records supported successful Stripe PaymentIntent
-allocations as manual Odoo receipts through the payment-register wizard. It
-requires posting, an inbound manual payment method with an outstanding account,
-and `receipt_ownership_confirmed: true`. Configure a Stripe clearing journal;
-confirm existing bank feeds do not also create those receipts.
+Stripe invoices become Moneybird **external sales invoices**: `reference` holds
+the Stripe invoice number, `source` is `Stripe`, and `source_url` is the Stripe
+dashboard URL carrying the Stripe ID. Credit notes become external sales invoices
+with negative lines whose descriptions name the original invoice. Each line keeps
+its Stripe tax rate and the configured revenue ledger account. A quantity is kept
+when the unit price is exact in currency units; otherwise the line is collapsed to
+quantity one with the original quantity in the description so totals stay exact.
+With `line_periods: true` the Stripe service period is passed as the Moneybird
+detail period, which defers the revenue over that period in the profit and loss
+report; this is off by default because it is a bookkeeping policy.
 
-Receipt import handles full and partial payments and verifies the remaining
-receivable. It rejects a PaymentIntent shared across invoices, overpayments,
+Optional `sync_payments: true` records supported successful Stripe PaymentIntent
+allocations as payments on the external sales invoice, on the configured
+`payment_financial_account_id` with the Stripe invoice payment ID as transaction
+identifier. It requires `receipt_ownership_confirmed: true`: use a dedicated
+Stripe financial account in Moneybird and confirm no bank feed also books those
+receipts. Payments are only supported in the administration's base currency,
+because Moneybird needs a base amount and the worker never invents an exchange rate.
+
+Payment import handles full and partial payments and verifies the remaining
+unpaid amount. It rejects a PaymentIntent shared across invoices, overpayments,
 customer balances, unsupported payment types, and unmatched external payments.
-Pre-payment credits can reconcile against the original invoice. Post-payment
-credits, refunds, disputes, and bad-debt treatment require accountant review.
-The worker imports credit documents but never invents refund cash movements.
+A credit note applied to an open invoice is imported but its settlement against
+the invoice is left for accountant review. Post-payment credits, refunds,
+disputes, and bad-debt treatment also require accountant review; the worker
+imports credit documents but never invents refund cash movements.
+
+Voided Stripe invoices and credit notes stop for review by default. With
+`void_action: "delete"` the worker deletes an external sales invoice it created
+itself, provided no payment is registered on it and it was not adopted from a
+manual entry. Uncollectible invoices stop for review by default; with
+`uncollectible_action: "mark"` the worker marks the external sales invoice as
+uncollectible once.
 
 `reconcile` emits Stripe balance-transaction totals by currency and reporting
-category. It is a read-only settlement report, not an automatic Odoo bank
+category. It is a read-only settlement report, not an automatic Moneybird bank
 reconciler. Fees, payouts, refund cash, and disputes remain owned by the existing
 accounting process. No fallback tax, write-off, or balancing line is invented.
 
-Supported taxes are mapped Odoo sales percentage taxes, exclusive of price,
-without compound bases and with invoice-based exigibility. Stripe inclusive
-prices are normalized to net values. Shipping, billing credit grants, Connect
+Supported taxes are mapped Moneybird sales tax rates with the same percentage as
+the Stripe tax rate. Stripe inclusive prices are normalized to net values. A line
+with more than one Stripe tax rate, shipping, billing credit grants, Connect
 issuers/transfers, unsupported rounding/precision, and unknown tax treatments
 stop the affected invoice for review. Other invoices continue, but the run exits
 unsuccessfully so partial failure remains visible.
 
+Moneybird allows 150 requests per five minutes per administration. The worker
+waits for `Retry-After` on 429 responses (a throttled request is never
+committed), indexes the Stripe-sourced external sales invoices once per run, and
+caches each document read within a run.
+
 ## Configuration
 
 Copy `config.example.json` to ignored `config.local.json` for local work. The
-example's IDs and date are placeholders, not an accounting configuration. Fill in:
+example's IDs and date are placeholders, not an accounting configuration.
+Moneybird IDs are strings. Fill in:
 
 | Setting | Meaning |
 | --- | --- |
 | `stripe_account_id`, `livemode` | Expected Stripe account and test/live mode; both are checked even for an empty account. |
 | `start_date` | Approved invoice **creation-date** cutoff. Do not move it forward to hide failures. Earlier issued invoices require a separate migration decision. |
-| `company_id`, `sales_journal_id`, `income_account_id` | Existing Odoo record IDs in the intended company. |
-| `currencies` | Currency code to `{odoo_id, decimals}`. Only explicitly configured currencies are accepted. Use Stripe's currency-specific exponent, checked against Odoo. |
-| `tax_map` | Stripe tax-rate ID to existing Odoo tax ID, e.g. `{"txr_example": 42}`. |
-| `no_tax` | Explicit treatment to Odoo tax-ID list. `{"none": []}` deliberately accepts ordinary untaxed sales; exempt and reverse-charge treatments require reporting tax IDs. |
-| `partner_map` | Optional Stripe customer ID to an existing Odoo partner ID. Use for migration matches and changed historical customer snapshots. |
-| `document_map` | Optional Stripe invoice/credit-note ID to an existing Odoo move ID, to resolve ambiguous migration matches. Financial verification still applies. |
-| `income_account_map` | Optional Stripe product ID to an Odoo income account ID; otherwise use the configured income account. |
-| `post_invoices`, `sync_payments` | Boolean opt-ins, both false initially. |
-| `sync_pdfs` | Preserve original invoice and credit-note PDFs as Odoo attachments; true by default. |
+| `timezone` | Time zone used to turn Stripe timestamps into Moneybird dates. |
+| `administration_id` | The Moneybird administration the token must have access to. |
+| `revenue_ledger_account_id` | Default revenue ledger account for invoice lines. |
+| `currencies` | Currency code to number of decimals, e.g. `{"EUR": 2}`. Only explicitly configured currencies are accepted. |
+| `tax_map` | Stripe tax-rate ID to Moneybird sales tax-rate ID. |
+| `tax_rate_map` | Optional `"<country>:<percentage>"` to Moneybird tax-rate ID, e.g. `{"NL:21": "…"}`, for Stripe Tax, which creates a new tax-rate ID per invoice. Used only for tax-rate IDs missing from `tax_map`; an unmapped rate fails the invoice. Preflight checks the percentage. |
+| `period_separator` | Optional word between the dates in a subscription line's period, default `to` (e.g. `tot` for Dutch). |
+| `no_tax` | Stripe exemption treatment (`none`, `exempt`, `reverse`) to a zero-percentage Moneybird tax rate. `none` covers ordinary untaxed sales. |
+| `contact_map` | Optional Stripe customer ID to an existing Moneybird contact ID. Use for migration matches and changed historical customer snapshots. |
+| `document_map` | Optional Stripe invoice/credit-note ID to an existing external sales invoice ID, to resolve ambiguous migration matches. Financial verification still applies. |
+| `ledger_account_map` | Optional Stripe product ID to a revenue ledger account ID; otherwise the default account is used. |
+| `default_contact_country` | Moneybird requires a country on each contact. Stripe customers without a billing country stop for review unless this two-letter code is set. |
+| `skip_zero_total` | Skip invoices with a zero total (free trials, fully discounted periods) instead of booking a zero document and creating a contact; false by default. |
+| `line_periods` | Pass Stripe service periods as Moneybird detail periods; false by default. |
+| `sync_pdfs` | Preserve original invoice and credit-note PDFs as attachments; true by default. |
+| `sync_payments`, `receipt_ownership_confirmed`, `payment_financial_account_id` | Payment import opt-in, its ownership confirmation and the Stripe financial account. |
+| `void_action` | `review` (default) or `delete`. |
+| `uncollectible_action` | `review` (default) or `mark`. |
 
-Contacts first use explicit mappings and existing connector references. Otherwise,
-the worker searches the intended company and shared contacts, including archived
-records. A unique match requires the same normalized name plus VAT number or
-email, without conflicting VAT numbers. Name-only, email-only, conflicting,
-ambiguous, and archived matches stop for review; no replacement contact is created.
-It creates a new contact only when no possible existing contact is found.
+Fully discounted invoices (total 0) without tax lines use the `none` rate whatever
+the customer's exemption status. Subscription lines take the product name shown on
+Stripe's PDF plus the service period; one-off lines keep their Stripe description.
+Discounts appear as separate negative lines named after the coupon, like Stripe's
+PDF; the worker reads coupons when the key allows and falls back to "Discount".
 
-Auto-created contacts use the finalized invoice's name, address, and EU VAT ID.
-The first snapshot is frozen. A later differing snapshot requires an explicit
-`partner_map`. Existing contacts are reused without overwriting their details.
-Original document numbers and Stripe PDF links are stored on the Odoo move;
-Odoo keeps its own document sequence. Original PDF bytes are saved as private
-attachments on the corresponding Odoo move, including matched existing invoices.
-A saved attachment reference prevents repeat uploads. Existing invoice attachments
-named `Invoice-<Stripe invoice number>.pdf` are also reused on the matched Odoo
-invoice. Downloads are limited to 8 MiB and checked for a PDF header before
-creating accounting records. The ledger tracks attachment writes and recovers
-responses lost after upload. Missing or altered saved attachments stop for review.
+Contacts first use explicit mappings and the Stripe customer ID stored as the
+Moneybird `customer_id` of contacts the worker created. Otherwise, the worker
+searches contacts, including archived ones, by e-mail, VAT number and name. A
+unique match requires the same normalized name plus VAT number or e-mail, without
+conflicting VAT numbers. A Stripe customer without a name matches a unique e-mail.
+Name-only, e-mail-only, conflicting, ambiguous, and archived matches stop for
+review; no replacement contact is created. It creates a
+new contact only when no possible existing contact is found.
 
-Existing documents first use saved links or the connector's deterministic
-reference. For manually entered invoices, automatic matching requires a unique
-match on company, customer, invoice type, currency, issue date, net amount, and
-total. The worker then verifies the sales journal, the complete multiset of line
-net amounts/accounts/tax IDs, and actual tax amounts per tax ID. It permits
-different descriptions, line order, and collapsed quantities in a manual invoice
-when those financial details agree. Credit notes also need the correct original
-invoice link. Ambiguous or incompatible candidates stop for review instead of
-creating another invoice. An explicit `document_map` resolves ambiguity but cannot
-bypass financial verification.
+Auto-created contacts use the finalized invoice's name, address, e-mail and EU
+VAT ID as company contacts; a customer without a name is named after its e-mail
+address. Each Stripe customer is resolved once per run. The first snapshot is frozen. A later differing
+snapshot requires an explicit `contact_map`. Existing contacts are reused without
+overwriting their details. Original PDF bytes are uploaded as attachments on the
+corresponding external sales invoice, including matched existing invoices. A
+saved attachment is recognised by its filename `Stripe-<Stripe ID>.pdf`; an
+existing attachment named `Invoice-<Stripe invoice number>.pdf` on a matched
+invoice is reused. Downloads are limited to 8 MiB and checked for a PDF header
+before creating accounting records. Missing or altered saved attachments stop for
+review.
+
+Existing documents first use saved links or the deterministic `source_url`. For
+manually entered external sales invoices, automatic matching requires a unique
+match on contact, issue date, currency, net amount, and total. The worker then
+verifies the complete multiset of line net amounts, ledger accounts and tax
+rates. It permits different descriptions, line order, and collapsed quantities
+in a manual invoice when those financial details agree. Ambiguous or incompatible
+candidates stop for review instead of creating another invoice. An explicit
+`document_map` resolves ambiguity but cannot bypass financial verification.
+Moneybird's own sales invoices (issued by Moneybird) are never adopted.
 
 Contact and document links are stored in SQLite, including during dry runs.
-Existing Odoo references, document numbers, lines, and contact details stay intact.
-Each Odoo document can belong to only one Stripe document within this ledger.
-Every replay revalidates the linked target; a missing or changed target never
-falls back to creating a replacement. Uncertain write intents cannot be overridden
-by migration matching. Preserve and back up the ledger for scheduled runs.
+Each Moneybird document can belong to only one Stripe document within this
+ledger. Every replay revalidates the linked target; a missing or changed target
+never falls back to creating a replacement. Uncertain write intents cannot be
+overridden by migration matching. Preserve and back up the ledger for scheduled
+runs. Adopted invoices and credits are never automatically paid, deleted or
+marked uncollectible.
 
-Adopted invoices and credits are not automatically posted, cancelled, or settled.
-Enabling receipt import for a linked invoice, reconciling a linked credit, or
-voiding a linked source stops for review so existing accounting is not duplicated.
-Archiving a missing original PDF is allowed independently of those accounting actions.
-
-Set `STRIPE_API_KEY` and `ODOO_API_KEY` through the environment. Stripe requires
-read access to Account, Balance, Invoices/lines, Credit Notes/lines, Invoice
-Payments, PaymentIntents when importing receipts, and Balance Transactions when
-running settlement reports. Use an Odoo integration user scoped to the company
-with contact, accounting, and attachment permissions, and track its API key expiry. External
-API entitlement is required on the Odoo subscription.
+Set `STRIPE_API_KEY` and `MONEYBIRD_API_TOKEN` through the environment. Stripe
+requires read access to Account, Balance, Invoices/lines, Credit Notes/lines,
+Tax Rates, Invoice Payments, PaymentIntents when importing payments, and Balance
+Transactions when running settlement reports. The Moneybird token needs the
+`sales_invoices` scope for contacts, external sales invoices, tax rates and
+ledger accounts, and `settings` for financial accounts when importing payments.
 
 ## Commands
 
 Run from this directory after supplying credentials and an approved configuration:
 
 ```sh
-python -m stripe_odoo sync --config config.local.json --state ./state/ledger.sqlite3
-python -m stripe_odoo sync --mode apply --config config.local.json --state ./state/ledger.sqlite3
-python -m stripe_odoo backfill --from-date 2026-01-01 --config config.local.json --state ./state/ledger.sqlite3
-python -m stripe_odoo reconcile --config config.local.json --state ./state/ledger.sqlite3
-python -m stripe_odoo status --state ./state/ledger.sqlite3
-python -m stripe_odoo backup --state ./state/ledger.sqlite3 --output ./state/snapshot.sqlite3
+python -m stripe_moneybird sync --config config.local.json --state ./state/ledger.sqlite3
+python -m stripe_moneybird sync --mode apply --config config.local.json --state ./state/ledger.sqlite3
+python -m stripe_moneybird backfill --from-date 2026-01-01 --config config.local.json --state ./state/ledger.sqlite3
+python -m stripe_moneybird reconcile --config config.local.json --state ./state/ledger.sqlite3
+python -m stripe_moneybird status --state ./state/ledger.sqlite3
+python -m stripe_moneybird backup --state ./state/ledger.sqlite3 --output ./state/snapshot.sqlite3
 ```
 
 `backfill` uses the same importer. Its optional narrower boundary cannot precede
@@ -220,26 +259,27 @@ manual jobs, status, recovery, and backup snapshots from concurrent state access
 
 ## Recovery and state retention
 
-SQLite binds the state volume to Stripe account, test/live mode, Odoo URL/database,
-and company. It stores durable write intents before Odoo mutations and records
-target IDs before verification. Replays verify existing records instead of
-creating duplicates. A lost create response is recovered if the exact reference
-is found and its accounting fields agree. The same applies to posting and receipt
-actions. If a previous write may still complete and no result is found, the
-worker stops that operation for review. A local rollback cannot undo an Odoo write.
+SQLite binds the state volume to Stripe account, test/live mode and Moneybird
+administration. It stores durable write intents before Moneybird mutations and
+records target IDs before verification. Replays verify existing records instead
+of creating duplicates. A lost create response is recovered if the exact
+reference (`source_url`, contact `customer_id`, attachment filename, payment
+transaction identifier) is found and its accounting fields agree. If a previous
+write may still complete and no result is found, the worker stops that operation
+for review. A local rollback cannot undo a Moneybird write.
 
-Use `status` to inspect incomplete operations. Correct mappings or fix the Odoo
-draft causing verification errors before rerunning. Do not delete the ledger,
-remove reference fields, or reset operation rows to force a retry.
+Use `status` to inspect incomplete operations. Correct mappings or fix the
+Moneybird document causing verification errors before rerunning. Do not delete
+the ledger, remove reference fields, or reset operation rows to force a retry.
 
-If Odoo shows the result, rerun normally to recover it. If the operation has no
-result, an operator must verify that the original request has finished without
+If Moneybird shows the result, rerun normally to recover it. If the operation has
+no result, an operator must verify that the original request has finished without
 any accounting effect before permitting another attempt:
 
 ```sh
-python -m stripe_odoo resolve --state ./state/ledger.sqlite3 \
+python -m stripe_moneybird resolve --state ./state/ledger.sqlite3 \
   --reference 'EXACT_REFERENCE_FROM_STATUS' \
-  --reason 'Verified the original Odoo request finished without creating a record' \
+  --reason 'Verified the original Moneybird request finished without creating a record' \
   --confirm-request-finished-without-effect
 ```
 
@@ -250,9 +290,9 @@ constraint; preserve the ledger and ensure all invocations share its lock.
 
 Backups use SQLite's online backup API and an integrity check. Restore while all
 jobs are suspended and no pod is using the volume. Preserve the damaged state
-for investigation. A restored ledger can predate Odoo: the importer probes target
-references before creating anything, and uncertain or inconsistent records still
-require review. Treat the state and its backups as operational accounting data.
+for investigation. A restored ledger can predate Moneybird: the importer probes
+target references before creating anything, and uncertain or inconsistent records
+still require review. Treat the state and its backups as operational accounting data.
 
 ## Verification
 
@@ -262,24 +302,23 @@ From the repository root:
 python3 -m unittest discover -s tests -v
 uvx ruff@0.17.1 check .
 uvx ruff@0.17.1 format --check .
-docker build -t stripe-odoo-sync:test .
-docker run --rm --read-only stripe-odoo-sync:test --help
+docker build -t stripe-moneybird-sync:test .
+docker run --rm --read-only stripe-moneybird-sync:test --help
 ```
 
 These tests cover local accounting normalization, migration matching, contact
 reuse, ambiguous/changed/deleted targets, replay and crash recovery, partial
-receipts, unsafe wizard rejection, pagination, locks, and backup integrity.
-They do not replace accounting verification against an Odoo 19 test database.
+payments, rate limiting, pagination, locks, and backup integrity. They run
+against an in-memory Moneybird stand-in and do not replace accounting
+verification against a real administration.
 
 ## Image releases
 
-The included workflow checks pull requests and pushes to `main`. Publishing is
-an explicit manual workflow run with `publish` enabled. It builds amd64 and arm64 images under
-`ghcr.io/gwku/stripe-odoo-sync`, tagged with `VERSION` and
-`sha-<full Git commit>`. Pushes to `main` only check and build locally in CI.
-
-Keep the repository name `stripe-odoo-sync` and the `gwku` owner for
-your deployment's image path. Pin the production
-overlay to a published commit tag or image digest. The version tag is a build
-alias; do not rely on it as immutable. Deployment and Prometheus checks run
-in the separate infrastructure repository. Local tests never push an image.
+The included workflow checks pull requests and pushes. A push to `main` or
+`develop` also publishes amd64 and arm64 images under
+`ghcr.io/resoftware/stripe-moneybird-sync`, tagged
+`<branch>-<commit time UTC>-<sha7>` (the tag ArgoCD Image Updater follows on
+the Re: Software cluster), `sha-<full Git commit>` and the `VERSION` alias.
+The version tag is a build alias; do not rely on it as immutable. Local tests
+never push an image. The cluster manifests live in `resoftware-iac` under
+`deploy/projects/custom/stripe-moneybird-sync`.
