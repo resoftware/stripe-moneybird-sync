@@ -9,7 +9,7 @@
   "tax_map": {"txr_REPLACE": "123456789012345678"},
   "tax_rate_map": {},
   "period_separator": "to",
-  "no_tax": {"none": "123456789012345678"},
+  "no_tax": {"none": "123456789012345678", "reverse": "123456789012345679"},
   "untaxed_eu_tax_rate_id": null,
   "contact_map": {},
   "document_map": {},

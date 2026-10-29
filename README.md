@@ -176,7 +176,7 @@ Moneybird IDs are strings. Fill in:
 | `tax_rate_map` | Optional `"<country>:<percentage>"` to Moneybird tax-rate ID, e.g. `{"NL:21": "…"}`, for Stripe Tax, which creates a new tax-rate ID per invoice. Used only for tax-rate IDs missing from `tax_map`; an unmapped rate fails the invoice. Preflight checks the percentage. |
 | `period_separator` | Optional word between the dates in a subscription line's period, default `to` (e.g. `tot` for Dutch). |
 | `untaxed_eu_tax_rate_id` | Optional Moneybird sales rate (e.g. 21%) applied when Stripe collected no tax from a customer in the EU: the Stripe amount is booked tax-inclusive and Moneybird splits it per line, rounding half up. Non-EU customers, exempt or reverse-charge customers, taxed invoices and zero totals are unaffected. Use it when Stripe Tax is not enabled; the invoice's billing country decides, else the country of the card that paid, else `default_contact_country`. |
-| `no_tax` | Stripe exemption treatment (`none`, `exempt`, `reverse`) to a zero-percentage Moneybird tax rate. `none` covers ordinary untaxed sales. |
+| `no_tax` | Stripe exemption treatment (`none`, `exempt`, `reverse`) to a zero-percentage Moneybird tax rate. `none` covers ordinary untaxed sales. `reverse` is also used for a business customer in another EU country, recognised by an EU VAT ID on the Stripe customer or on the Moneybird contact (see below); it needs a Moneybird rate that reports in 3b, such as "Dienst binnen EU (btw verlegd)". |
 | `contact_map` | Optional Stripe customer ID to an existing Moneybird contact ID. Use for migration matches and changed historical customer snapshots. |
 | `document_map` | Optional Stripe invoice/credit-note ID to an existing external sales invoice ID, to resolve ambiguous migration matches. Financial verification still applies. |
 | `ledger_account_map` | Optional Stripe product ID to a revenue ledger account ID; otherwise the default account is used. |
@@ -203,8 +203,13 @@ Name-only, e-mail-only, conflicting, ambiguous, and archived matches stop for
 review; no replacement contact is created. It creates a
 new contact only when no possible existing contact is found.
 
-Auto-created contacts use the finalized invoice's name, address, e-mail and EU
-VAT ID as company contacts; a customer without a name is named after its e-mail
+A business customer in another EU country is reverse charged: when the Moneybird
+contact carries a VAT number (the bookkeeper maintains it) or Stripe holds an EU
+tax ID, untaxed lines use the `reverse` rate instead of domestic VAT. A VAT ID
+typed into an address line, which product customers do when checkout never asks
+for one, stops the invoice for review (`vat_number_in_address_requires_review`)
+until the number is moved to the contact's VAT field. Auto-created contacts use
+the finalized invoice's name, address, e-mail and EU VAT ID as company contacts; a customer without a name is named after its e-mail
 address. Each Stripe customer is resolved once per run. The first snapshot is frozen. A later differing
 snapshot requires an explicit `contact_map`. Existing contacts are reused without
 overwriting their details. Original PDF bytes are uploaded as attachments on the

@@ -113,7 +113,7 @@ class FakeStripe:
         return iter([])
 
 
-RATES = {"5": Decimal(21), "9": Decimal(0)}
+RATES = {"5": Decimal(21), "9": Decimal(0), "8": Decimal(0)}  # "8": a reverse-charge rate without percentage.
 
 
 def money(value):
@@ -936,6 +936,78 @@ class ImpliedTaxTests(unittest.TestCase):
                 settings["untaxed_eu_tax_rate_id"] = "9"  # The zero-percentage rate.
                 with self.assertRaisesRegex(SyncError, "positive_sales_rate"):
                     Worker(settings, stripe, moneybird, ledger, apply=True).run()
+
+
+class ReverseChargeTests(unittest.TestCase):
+    """A business customer in another EU country is reverse charged; VAT IDs in addresses stop for review."""
+
+    def setUp(self):
+        self.settings, self.stripe, self.moneybird = config(), FakeStripe(), FakeMoneybird()
+        self.settings.update(untaxed_eu_tax_rate_id="5", no_tax={"none": "9", "reverse": "8"})
+        self.moneybird.tax_rates.append(
+            {"id": "8", "percentage": None, "tax_rate_type": "sales_invoice", "active": True}
+        )
+        self.moneybird.contacts["6"] = {
+            "id": "6",
+            "company_name": "Example",
+            "archived": False,
+            "country": "BE",
+        }
+        self.stripe.invoices[0].update(total=900, total_excluding_tax=900, amount_paid=900)
+        self.stripe.invoices[0]["customer_address"]["country"] = "BE"
+        self.stripe.lines[0].update(amount=900, taxes=[])
+
+    def run_worker(self):
+        with patch("sys.stdout", new=io.StringIO()):
+            with tempfile.TemporaryDirectory() as temp, closing(Ledger(Path(temp) / "s.sqlite3")) as ledger:
+                return Worker(self.settings, self.stripe, self.moneybird, ledger, apply=True).run()
+
+    def test_contact_with_a_foreign_eu_vat_number_is_booked_reverse_charged(self):
+        self.moneybird.contacts["6"]["tax_number"] = "BE1019448323"
+        self.assertEqual(self.run_worker()["verified"], 1)
+        document = self.moneybird.invoices["11"]
+        self.assertFalse(document["prices_are_incl_tax"])
+        self.assertEqual(document["total_price_excl_tax"], "9.00")
+        self.assertEqual({detail["tax_rate_id"] for detail in document["details"]}, {"8"})
+
+    def test_stripe_tax_id_also_counts(self):
+        self.stripe.invoices[0]["customer_tax_ids"] = [{"type": "eu_vat", "value": "BE1019448323"}]
+        self.assertEqual(self.run_worker()["verified"], 1)
+        self.assertEqual(self.moneybird.invoices["11"]["total_price_excl_tax"], "9.00")
+
+    def test_vat_number_typed_into_the_address_stops_before_booking(self):
+        self.stripe.invoices[0]["customer_address"]["line2"] = "BE1019.448.323"
+        self.assertEqual(self.run_worker()["failed"], 1)
+        self.assertEqual(self.moneybird.creates, 0)
+        # The bookkeeper moves the number to the contact's VAT field; the next run books it reverse charged.
+        self.moneybird.contacts["6"]["tax_number"] = "BE1019448323"
+        self.assertEqual(self.run_worker()["verified"], 1)
+        self.assertEqual(self.moneybird.invoices["11"]["total_price_excl_tax"], "9.00")
+
+    def test_domestic_vat_number_keeps_domestic_vat(self):
+        self.moneybird.contacts["6"].update(country="NL", tax_number="NL123456789B01")
+        self.assertEqual(self.run_worker()["verified"], 1)
+        self.assertEqual(self.moneybird.invoices["11"]["total_price_excl_tax"], "7.44")
+
+    def test_reverse_charge_needs_its_mapping(self):
+        self.moneybird.contacts["6"]["tax_number"] = "BE1019448323"
+        del self.settings["no_tax"]["reverse"]
+        self.assertEqual(self.run_worker()["failed"], 1)
+        self.assertEqual(self.moneybird.creates, 0)
+
+    def test_vat_number_detection(self):
+        from stripe_moneybird.planning import looks_like_vat_number
+
+        for text in (
+            "BE1019.448.323",
+            "btw: NL 123.456.789 B01",
+            "DE123456789",
+            "FRXX123456789",
+            "EL123456789",
+        ):
+            self.assertTrue(looks_like_vat_number(text), text)
+        for text in (None, "", "Main 1", "Delftweg 12", "Dokter Snellaertstraat 53", "PO Box 12345678"):
+            self.assertFalse(looks_like_vat_number(text), text)
 
 
 class TaxRuleTests(unittest.TestCase):
