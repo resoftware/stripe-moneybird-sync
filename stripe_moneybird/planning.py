@@ -37,6 +37,19 @@ EU = {
     "SE",
 }
 
+# An EU VAT ID: country code (Greece uses EL, Northern Ireland XI) plus 8-12 characters, mostly digits.
+VAT_PATTERN = re.compile(
+    r"(?<![A-Z0-9])(?:" + "|".join(sorted(EU | {"EL", "XI"})) + r")[0-9A-Z]{8,12}(?![A-Z0-9])"
+)
+
+
+def looks_like_vat_number(text):
+    """True when free text (an address line) carries something shaped like an EU VAT ID."""
+    if not text:
+        return False
+    compact = re.sub(r"[\s.\-]", "", str(text).upper())
+    return any(sum(ch.isdigit() for ch in found.group(0)) >= 7 for found in VAT_PATTERN.finditer(compact))
+
 
 def reference(config, kind, source_id):
     return (
@@ -75,6 +88,9 @@ def taxes_for(config, invoice, line):
     # A fully discounted invoice carries no tax, whatever the customer's tax status; Moneybird still
     # needs a rate on the line, so the ordinary untaxed mapping is used.
     treatment = "none" if invoice.get("total") == 0 else invoice.get("customer_tax_exempt", "none")
+    if treatment == "none" and invoice.get("_reverse_charge"):
+        # The worker found an EU VAT ID for this customer (Stripe tax ID or the Moneybird contact).
+        treatment = "reverse"
     require(treatment in config["no_tax"], "no_tax_treatment_mapping_required")
     return config["no_tax"][treatment], {}, 0
 
@@ -251,7 +267,7 @@ def document_plan(config, source, invoice, lines, contact_id, original_number=No
 
 def implied_tax(config, invoice):
     rate_id = config.get("untaxed_eu_tax_rate_id")
-    if not rate_id or invoice.get("customer_tax_exempt", "none") != "none":
+    if not rate_id or invoice.get("customer_tax_exempt", "none") != "none" or invoice.get("_reverse_charge"):
         return None
     country = (
         invoice.get("_country")

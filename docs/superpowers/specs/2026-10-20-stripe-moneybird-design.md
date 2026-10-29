@@ -140,3 +140,26 @@ and the given rate; Moneybird derives the net per line (half-up rounding,
 confirmed against the API: € 9,00 → € 7,44 + € 1,56). Verification compares
 the derived nets. The lasting fix is Stripe Tax with address collection in the
 product, after which the rates arrive from Stripe via `tax_map`/`tax_rate_map`.
+
+## Reverse charge for EU business customers (2026-10-29)
+
+StaticForm's checkout collects no tax ID, so a Belgian agency typed its VAT number
+into address line 2 and Stripe treated it as a consumer. The sync then booked
+Dutch VAT on a B2B service, which belongs in 3b and the ICP listing instead.
+
+The worker now decides per invoice (`Worker.reverse_charge`): a VAT ID on the
+Moneybird contact (`tax_number`) or an EU tax ID on the Stripe invoice, combined
+with a contact country inside the EU other than the administration's own, sets
+`invoice["_reverse_charge"]`. Planning then treats untaxed lines as
+`customer_tax_exempt == "reverse"` (`no_tax.reverse`, a rate reporting in 3b) and
+skips the implied inclusive VAT. The Moneybird contact is the source of truth so
+the bookkeeper can fix a customer without touching Stripe or config; a changed
+VAT status on a booked customer shows up as a payload change and stops for review,
+as any accounting change should.
+
+Without a known VAT ID, an address line that looks like an EU VAT ID (country code
+plus 8-12 characters with at least 7 digits, after removing spaces, dots and
+dashes) stops the invoice with `vat_number_in_address_requires_review` before
+any contact or document is written. The fix at the source is tax-ID collection
+and Stripe Tax in the StaticForm checkout; this guard keeps the books right until
+then.

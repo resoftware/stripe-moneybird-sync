@@ -8,7 +8,7 @@ from decimal import Decimal
 from .core import SyncError, date_of, digest, log, major, minor, object_id, require
 from .matching import Matcher, identity
 from .pdf import PDFStore, validate_pdf
-from .planning import document_plan, reference, source_url
+from .planning import EU, document_plan, looks_like_vat_number, reference, source_url
 
 
 class Worker:
@@ -17,7 +17,7 @@ class Worker:
         self.apply = apply
         self.counts = defaultdict(int)
         self.cache, self.index, self.administration, self.contacts = {}, {}, None, {}
-        self.countries = {}
+        self.countries, self.contact_records = {}, {}
 
     # Moneybird reads are cached per run; writes evict the document they touch.
     def read(self, identifier, fresh=False):
@@ -116,6 +116,41 @@ class Worker:
         if source_id not in self.contacts:
             self.contacts[source_id] = self.resolve_contact(invoice, source_id)
         return self.contacts[source_id]
+
+    def contact_record(self, identifier):
+        if identifier not in self.contact_records:
+            self.contact_records[identifier] = self.moneybird.find(f"/contacts/{identifier}") or {}
+        return self.contact_records[identifier]
+
+    def reverse_charge(self, invoice, contact_id):
+        """A business customer in another EU country is reverse charged (Moneybird books it in 3b).
+
+        The VAT ID comes from Stripe's tax IDs or from the Moneybird contact, which the bookkeeper
+        maintains. A VAT ID typed into an address line, as product customers do when checkout never
+        asks for one, stops for review instead of being booked with domestic VAT."""
+        record = self.contact_record(contact_id) if contact_id else {}
+        stripe_ids = [
+            item["value"] for item in invoice.get("customer_tax_ids", []) if item["type"] == "eu_vat"
+        ]
+        vat = (record.get("tax_number") or "").strip() or (stripe_ids[0] if stripe_ids else "")
+        if not vat:
+            address = invoice.get("customer_address") or {}
+            lines = (
+                address.get("line1"),
+                address.get("line2"),
+                record.get("address1"),
+                record.get("address2"),
+            )
+            require(
+                not any(looks_like_vat_number(text) for text in lines),
+                "vat_number_in_address_requires_review",
+            )
+            return False
+        country = (
+            record.get("country") or invoice.get("_country") or self.config.get("default_contact_country")
+        )
+        home = (self.administration or {}).get("country") or self.config.get("default_contact_country")
+        return country in EU and country != home
 
     def resolve_contact(self, invoice, source_id):
         mapped = self.config.get("contact_map", {}).get(source_id)
@@ -512,6 +547,7 @@ class Worker:
         invoice["_discount_labels"] = self.discount_labels(invoice["_lines"])
         invoice["_country"] = self.customer_country(invoice)
         contact = self.contact(invoice)
+        invoice["_reverse_charge"] = self.reverse_charge(invoice, contact)
         document_id = self.document(invoice, invoice, invoice["_lines"], contact)
         if pdf is not None:
             self.attach_pdf(invoice, document_id, pdf)
