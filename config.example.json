@@ -21,6 +21,11 @@
   "sync_payments": false,
   "receipt_ownership_confirmed": false,
   "payment_financial_account_id": null,
+  "sync_payouts": false,
+  "payout_start_date": null,
+  "payout_bank_account_id": null,
+  "payout_clearing_ledger_account_id": null,
+  "payout_fee_ledger_account_id": null,
   "void_action": "review",
   "uncollectible_action": "review"
 }
