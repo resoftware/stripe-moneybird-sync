@@ -26,7 +26,8 @@ unless marked otherwise, and is open for revision before the first `apply` run.
 
 ## Non-goals and anti-goals
 
-- No bank reconciliation of Stripe payouts, fees, refunds or disputes. The
+- No bank reconciliation of refunds or disputes. Payouts and their fees are
+  settled since 2026-11 (opt-in `sync_payouts`, see the last section); the
   `reconcile` report stays read-only.
 - No Moneybird-native sales invoices. Stripe is the issuing system; Moneybird
   receives *external sales invoices* (`external_sales_invoices`), which is the
@@ -163,3 +164,35 @@ dashes) stops the invoice with `vat_number_in_address_requires_review` before
 any contact or document is written. The fix at the source is tax-ID collection
 and Stripe Tax in the StaticForm checkout; this guard keeps the books right until
 then.
+
+## Payout settlement (2026-11-20)
+
+With payments on, every Stripe receipt lands on the Stripe financial account and
+Moneybird parks it on "Te rubriceren ontvangen betalingen". The payout then
+arrives net on the ING. The bookkeeper booked those ING lines and a fee journal
+entry by hand. Nobody did that after 5 November, so three payouts stayed
+unprocessed. `sync_payouts` (`stripe_moneybird/payouts.py`) now does the same
+after the invoices in each run:
+
+1. List paid payouts with `arrival_date >= payout_start_date` and read their
+   balance transactions. Only `charge` and `fee` categories are accepted, the nets
+   must add up to the payout, and every charge must be an invoice payment the
+   worker already registered on the Stripe account (`payout_payment_not_booked`
+   otherwise). That keeps the clearing account balanced.
+2. Find the bank line: unprocessed, counterparty containing "STRIPE", exactly the
+   payout amount, within arrival minus 2 to plus 5 days. None yet is `pending`
+   (no failure); more than one stops for review.
+3. Post the journal entry `Stripe fees payout po_…` (`POST
+   /documents/general_journal_documents`; the earlier 404 was the path without
+   `/documents`): debit `payout_fee_ledger_account_id`, credit
+   `payout_clearing_ledger_account_id`, amount gross minus payout. Lookup is by
+   reference, so a lost response does not post twice.
+4. `PATCH /financial_mutations/{id}/link_booking` with `LedgerAccount` =
+   clearing, `price_base` = payout, and a description carrying the payout ID.
+   Lookup is the payout ID in a booking description, so a replay and the
+   bookkeeper can both see that it is done.
+
+`link_booking` takes amounts as absolute values, so a single bank line cannot
+carry the fee as a negative split. That is why the fee goes through a journal
+entry. Payouts before `payout_start_date` were settled by hand with slightly
+different references and are not revisited.

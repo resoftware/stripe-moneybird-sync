@@ -28,7 +28,8 @@ infrastructure repository and are not included here.
 
 Requirements: Python 3.13 or newer on Linux/macOS, Stripe API access, and a
 Moneybird administration with an API token (a personal API token or an OAuth
-access token with the `sales_invoices` and `settings` scopes). The worker uses
+access token with the `sales_invoices` and `settings` scopes, plus `bank` and `documents`
+for payout settlement). The worker uses
 Stripe's REST API and Moneybird's API v2, with only the Python standard library.
 
 ```sh
@@ -141,10 +142,25 @@ manual entry. Uncollectible invoices stop for review by default; with
 `uncollectible_action: "mark"` the worker marks the external sales invoice as
 uncollectible once.
 
+Optional `sync_payouts: true` settles Stripe payouts on the bank account, on top
+of the payment import. Each receipt is registered on the Stripe financial account,
+which Moneybird parks on a clearing ledger account. For every paid payout that
+arrives on or after `payout_start_date`, the worker finds the unprocessed bank
+line from Stripe with exactly the payout amount (arrival date minus 2 to plus 5
+days) and books it to that clearing account (`link_booking`). It then posts a
+journal entry (memoriaal) "Stripe fees payout po_…" that debits the fee account
+and credits clearing for the difference between the gross charges and the payout.
+The clearing account then nets to zero for that payout. A payout is only settled
+when every charge in it is an invoice payment already registered by the worker,
+and its balance transactions add up to the payout. Refunds, disputes, adjustments
+and an ambiguous bank line stop for review. A bank line that has not arrived yet
+is left for the next run. This needs the `bank` and `documents` scopes on the
+Moneybird token; preflight checks them.
+
 `reconcile` emits Stripe balance-transaction totals by currency and reporting
-category. It is a read-only settlement report, not an automatic Moneybird bank
-reconciler. Fees, payouts, refund cash, and disputes remain owned by the existing
-accounting process. No fallback tax, write-off, or balancing line is invented.
+category. It is a read-only settlement report. Without `sync_payouts`, fees,
+payouts, refund cash, and disputes remain owned by the existing accounting
+process. No fallback tax, write-off, or balancing line is invented.
 
 Supported taxes are mapped Moneybird sales tax rates with the same percentage as
 the Stripe tax rate. Stripe inclusive prices are normalized to net values. A line
@@ -185,6 +201,7 @@ Moneybird IDs are strings. Fill in:
 | `line_periods` | Pass Stripe service periods as Moneybird detail periods; false by default. |
 | `sync_pdfs` | Preserve original invoice and credit-note PDFs as attachments; true by default. |
 | `sync_payments`, `receipt_ownership_confirmed`, `payment_financial_account_id` | Payment import opt-in, its ownership confirmation and the Stripe financial account. |
+| `sync_payouts`, `payout_start_date`, `payout_bank_account_id`, `payout_clearing_ledger_account_id`, `payout_fee_ledger_account_id` | Payout settlement opt-in (requires `sync_payments`): payouts arriving from this date, the bank account that receives them, the ledger account Moneybird parks the receipts on, and the Stripe fee expense account. |
 | `void_action` | `review` (default) or `delete`. |
 | `uncollectible_action` | `review` (default) or `mark`. |
 

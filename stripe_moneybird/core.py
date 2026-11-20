@@ -452,6 +452,7 @@ def load_config(path):
         "sync_pdfs",
         "line_periods",
         "skip_zero_total",
+        "sync_payouts",
     ):
         require(type(config.get(key, key == "sync_pdfs")) is bool, f"invalid_{key}")
     require(config.get("void_action", "review") in ("review", "delete"), "invalid_void_action")
@@ -467,4 +468,13 @@ def load_config(path):
         require(
             identifier(config.get("payment_financial_account_id")), "configure_payment_financial_account_id"
         )
+    if config.get("sync_payouts"):
+        require(config.get("sync_payments") is True, "sync_payouts_requires_sync_payments")
+        for key in (
+            "payout_bank_account_id",
+            "payout_clearing_ledger_account_id",
+            "payout_fee_ledger_account_id",
+        ):
+            require(identifier(config.get(key)), f"configure_{key}")
+        dt.date.fromisoformat(config.get("payout_start_date") or "")
     return config

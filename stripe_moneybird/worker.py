@@ -7,6 +7,7 @@ from decimal import Decimal
 
 from .core import SyncError, date_of, digest, log, major, minor, object_id, require
 from .matching import Matcher, identity
+from .payouts import Payouts
 from .pdf import PDFStore, validate_pdf
 from .planning import EU, document_plan, looks_like_vat_number, reference, source_url
 
@@ -98,6 +99,8 @@ class Worker:
                 and account["currency"] == self.administration["currency"],
                 "invalid_payment_financial_account",
             )
+        if config.get("sync_payouts"):
+            Payouts(self).preflight()
         self.index = {}
         start = self.config["start_date"].replace("-", "")
         today = dt.date.today().isoformat().replace("-", "")
@@ -617,6 +620,9 @@ class Worker:
             except (KeyError, TypeError, ValueError, ArithmeticError):
                 self.counts["failed"] += 1
                 log("document_failed", source_id=invoice["id"], code="unsupported_source_or_target_schema")
+        if self.config.get("sync_payouts"):
+            # After the invoices, so a payout finds the receipts this run just imported.
+            Payouts(self).run()
         return dict(self.counts)
 
     def reconcile(self):
